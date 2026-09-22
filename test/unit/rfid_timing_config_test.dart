@@ -448,4 +448,113 @@ void main() {
       }
     });
   });
+  group('RfidTimingConfig enabledReaders', () {
+    test('預設全部啟用，任何 id 都算啟用，toJson 省略欄位', () {
+      const config = RfidTimingConfig.defaults;
+      expect(config.enabledReaders, isEmpty);
+      expect(config.allReadersEnabled, isTrue);
+      expect(config.isReaderEnabled('01'), isTrue);
+      expect(config.isReaderEnabled('07'), isTrue);
+      expect(config.enabledDeviceIds(['01', '02', '03']), ['01', '02', '03']);
+      expect(config.enabledReadersText, '全部');
+      expect(
+        config.toJson().containsKey(RfidTimingConfig.enabledReadersKey),
+        isFalse,
+      );
+    });
+
+    test('parseReaderNumbers 接受清單與字串，排序去重，壞值回 null', () {
+      expect(RfidTimingConfig.parseReaderNumbers([3, 1, 3]), [1, 3]);
+      expect(RfidTimingConfig.parseReaderNumbers(['07', '2', 2.0]), [2, 7]);
+      expect(RfidTimingConfig.parseReaderNumbers('1, 2,7'), [1, 2, 7]);
+      expect(RfidTimingConfig.parseReaderNumbers('1、2 7'), [1, 2, 7]);
+      expect(RfidTimingConfig.parseReaderNumbers(''), isEmpty);
+      expect(RfidTimingConfig.parseReaderNumbers(const <int>[]), isEmpty);
+      expect(RfidTimingConfig.parseReaderNumbers('1,x'), isNull);
+      expect(RfidTimingConfig.parseReaderNumbers([0, 1]), isNull);
+      expect(RfidTimingConfig.parseReaderNumbers(42), isNull);
+      expect(RfidTimingConfig.parseReaderNumbers(null), isNull);
+    });
+
+    test('只啟用部分讀卡機：isReaderEnabled、enabledDeviceIds 與文字', () {
+      const config = RfidTimingConfig(enabledReaders: [1, 7]);
+      expect(config.allReadersEnabled, isFalse);
+      expect(config.isReaderEnabled('01'), isTrue);
+      expect(config.isReaderEnabled('7'), isTrue);
+      expect(config.isReaderEnabled('02'), isFalse);
+      expect(config.isReaderEnabled('abc'), isFalse);
+      expect(config.enabledDeviceIds(['01', '02', '07']), ['01', '07']);
+      expect(config.enabledReadersText, '01、07');
+      expect(
+        config.describe()[RfidTimingConfig.enabledReadersLabel],
+        '01、07',
+      );
+    });
+
+    test('JSON 往返、fromJson 容忍字串與壞值、validated 正規化', () {
+      const config = RfidTimingConfig(rstSettleMs: 20, enabledReaders: [2, 5]);
+      final json = config.toJson();
+      expect(json[RfidTimingConfig.enabledReadersKey], [2, 5]);
+      expect(RfidTimingConfig.fromJson(json), config);
+      expect(RfidTimingConfig.fromJson(json).hashCode, config.hashCode);
+      expect(config, isNot(const RfidTimingConfig(rstSettleMs: 20)));
+
+      final fromStrings = RfidTimingConfig.fromJson({
+        'enabledReaders': ['07', '1'],
+      });
+      expect(fromStrings.enabledReaders, [1, 7]);
+      // 壞值與缺欄位都沿用 base；空清單代表全部
+      expect(
+        RfidTimingConfig.fromJson({'enabledReaders': 'x'}, base: config)
+            .enabledReaders,
+        [2, 5],
+      );
+      expect(
+          RfidTimingConfig.fromJson({}, base: config).enabledReaders, [2, 5]);
+      expect(
+        RfidTimingConfig.fromJson({'enabledReaders': []}, base: config)
+            .enabledReaders,
+        isEmpty,
+      );
+
+      const messy = RfidTimingConfig(enabledReaders: [3, 1, 3]);
+      expect(messy.validated().enabledReaders, [1, 3]);
+      const broken = RfidTimingConfig(enabledReaders: [0, 1]);
+      expect(broken.validated().enabledReaders, isEmpty);
+    });
+
+    test('withValue、覆寫與 copyWith 保留啟用清單，forReader 不帶', () {
+      const config = RfidTimingConfig(enabledReaders: [1]);
+      expect(config.withValue('rstSettleMs', 5).enabledReaders, [1]);
+      expect(
+        config.withReaderOverride('01', 'rstSettleMs', 9).enabledReaders,
+        [1],
+      );
+      expect(config.withoutReaderOverrides().enabledReaders, [1]);
+      expect(
+          config.copyWith(enabledReaders: const []).allReadersEnabled, isTrue);
+      expect(config.forReader('01').enabledReaders, isEmpty);
+    });
+
+    test('RFID_ENABLED_READERS 環境變數覆寫，壞值記在 invalid', () async {
+      final applied = <String>[];
+      final invalid = <String>[];
+      final config = RfidTimingConfig.defaults.applyEnvironment(
+        {'RFID_ENABLED_READERS': '1, 2'},
+        applied: applied,
+        invalid: invalid,
+      );
+      expect(config.enabledReaders, [1, 2]);
+      expect(applied, ['enabledReaders']);
+      expect(invalid, isEmpty);
+
+      final result = await RfidTimingConfig.load(
+        filePath: '/nonexistent/rfid_timing.json',
+        environment: const {'RFID_ENABLED_READERS': 'one'},
+      );
+      expect(result.envInvalid, ['RFID_ENABLED_READERS']);
+      expect(result.config.allReadersEnabled, isTrue);
+      expect(result.sourceDescription, contains('RFID_ENABLED_READERS'));
+    });
+  });
 }

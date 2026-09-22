@@ -124,15 +124,26 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
   List<String> get _deviceIds => _configs.map((c) => c.deviceId).toList();
 
+  /// 設定裡啟用 (要掃描) 的讀卡機；設定尚未載入時視為全部
+  List<String> _enabledDeviceIds(RfidTimingConfig config) =>
+      config.enabledDeviceIds(_deviceIds);
+
   @override
   List<RFIDReader> get readers {
     // Return virtual readers based on configs
-    return _configs.map((config) {
-      final reading = _latestReadings[config.deviceId];
+    final config = _timingLoad?.config;
+    return _configs.map((rc522) {
+      final reading = _latestReadings[rc522.deviceId];
+      final ReaderStatus status;
+      if (config != null && !config.isReaderEnabled(rc522.deviceId)) {
+        status = ReaderStatus.disabled;
+      } else {
+        status = reading?.status ?? ReaderStatus.init;
+      }
       return _VirtualRFIDReader(
-        deviceId: config.deviceId,
-        status: reading?.status ?? ReaderStatus.init,
-        address: 'SPI${config.spiNum}.0/GPIO${config.rstPin}',
+        deviceId: rc522.deviceId,
+        status: status,
+        address: 'SPI${rc522.spiNum}.0/GPIO${rc522.rstPin}',
       );
     }).toList();
   }
@@ -159,10 +170,10 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     }
     map['設定來源'] = load.sourceDescription;
     map.addAll(load.config.describe());
-    map['估計一輪 (全部沒卡)'] =
-        '約 ${load.config.estimateNoCardScanMsFor(_deviceIds)} ms';
-    map['估計一輪 (七顆都有卡)'] =
-        '約 ${load.config.estimateAllCardsScanMsFor(_deviceIds)} ms';
+    final enabled = _enabledDeviceIds(load.config);
+    map['估計一輪 (全部沒卡)'] = '約 ${load.config.estimateNoCardScanMsFor(enabled)} ms';
+    map['估計一輪 (啟用的都有卡)'] =
+        '約 ${load.config.estimateAllCardsScanMsFor(enabled)} ms';
     if (_lastScanDuration != null) {
       map['上次掃描耗時'] = '${_lastScanDuration!.inMilliseconds} ms'
           '${_lastCycleMs != null ? ' (硬體輪巡 $_lastCycleMs ms)' : ''}';
@@ -248,17 +259,21 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
     try {
       final load = await _ensureTiming();
+      final enabled = _enabledDeviceIds(load.config);
+      final enabledSet = enabled.toSet();
 
-      // Convert configs to serializable format for isolate
+      // Convert configs to serializable format for isolate.
+      // 全部接線都傳過去 (沒啟用的 RST 也要拉低)，`active` 才是要讀的那幾顆。
       final message = <String, dynamic>{
         'configs': [for (final config in _readerConfigs) config.toJson()],
         'timing': load.config.toJson(),
+        'active': enabled,
       };
 
       // 掃描在 background isolate 跑；整輪逾時的判斷放在這一邊：
       // worker 不會被中途丟下，掃完一定會關閉 GPIO / SPI。逾時後 _scanInFlight 會維持到
       // worker 真的結束，期間的掃描與校正都被略過，GPIO 才不會一直 busy 到重啟。
-      final timeout = load.config.scanTimeoutFor(_configs.length);
+      final timeout = load.config.scanTimeoutFor(enabled.length);
       job = compute(_performScanInIsolate, message);
       final raw = await job.timeout(
         timeout,
@@ -282,7 +297,9 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
       for (final config in _configs) {
         final result = cycle.readers[config.deviceId];
-        final reading = _toReading(config.deviceId, result);
+        final reading = enabledSet.contains(config.deviceId)
+            ? _toReading(config.deviceId, result)
+            : RFIDReading.disabled(config.deviceId);
         readings.add(reading);
         _latestReadings[config.deviceId] = reading;
         if (result != null) _latestResults[config.deviceId] = result;
@@ -294,9 +311,14 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
       debugPrint('Error during scan: $e');
       _lastScanDuration = stopwatch.elapsed;
 
-      // Return error readings for all readers
+      // Return error readings for all enabled readers (沒啟用的維持「未啟用」)
+      final enabledSet = _timingLoad == null
+          ? _deviceIds.toSet()
+          : _enabledDeviceIds(_timingLoad!.config).toSet();
       final errorReadings = _configs
-          .map((config) => RFIDReading.error(config.deviceId, e.toString()))
+          .map((config) => enabledSet.contains(config.deviceId)
+              ? RFIDReading.error(config.deviceId, e.toString())
+              : RFIDReading.disabled(config.deviceId))
           .toList();
 
       _latestResults.clear();
@@ -356,9 +378,17 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     );
   }
 
+  /// [message] 裡的 `active` (要讀的 deviceId 清單)；沒有就是全部
+  static Set<String>? _activeIdsFrom(Map<String, dynamic> message) {
+    final raw = message['active'];
+    if (raw is! List) return null;
+    return raw.map((id) => id.toString()).toSet();
+  }
+
   /// Static method for isolate execution (no instance state access)
   ///
-  /// [message] 內含 `configs` (接線) 與 `timing` (時序設定) 的 JSON。
+  /// [message] 內含 `configs` (接線)、`timing` (時序設定) 的 JSON，
+  /// 與 `active` (要讀的 deviceId；其餘 RST 仍拉低)。
   static Future<Map<String, dynamic>> _performScanInIsolate(
     Map<String, dynamic> message,
   ) async {
@@ -373,7 +403,10 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     final pollingService = RFIDPollingService(timing: timing, log: debugPrint);
     // 逾時由主 isolate 判斷 (見 scanAll)，這裡一定把整輪跑完並關閉 session
     try {
-      final result = await pollingService.performOneLoopCycles(configs);
+      final result = await pollingService.performOneLoopCycles(
+        configs,
+        activeDeviceIds: _activeIdsFrom(message),
+      );
       return result.toJson();
     } catch (e) {
       debugPrint('❌ Error in isolate scan: $e');
@@ -401,6 +434,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
         'samples': samples,
         'configs': [for (final config in _readerConfigs) config.toJson()],
         'base': load.config.toJson(),
+        'active': _enabledDeviceIds(load.config),
       },
       onProgress: (map) => onProgress?.call(map['message'] as String? ?? ''),
     );
@@ -423,6 +457,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
         'options': options.toJson(),
         'configs': [for (final config in _readerConfigs) config.toJson()],
         'base': load.config.toJson(),
+        'active': _enabledDeviceIds(load.config),
       },
       onProgress: (map) => onProgress?.call(OptimizerProgress.fromJson(map)),
       cancel: cancel,
@@ -545,6 +580,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
         configs: configs,
         base: base,
         log: debugPrint,
+        activeDeviceIds: _activeIdsFrom(message),
       );
 
       if (message['kind'] == 'probe') {

@@ -8,8 +8,11 @@
 /// 1. RST 拉高 → 等 [RfidTimingConfig.rstSettleMs] 讓振盪器啟動
 /// 2. 讀 VersionReg 確認 SPI 線路真的接到晶片 (線路異常會直接回報，不再假裝「沒有卡」)
 /// 3. 設定暫存器 (寫入後讀回驗證)、開天線 → 等 [RfidTimingConfig.antennaSettleMs] 讓卡片上電
-/// 4. REQA (最多 [RfidTimingConfig.reqaAttempts] 次，第二次起改用 WUPA) → anticoll 取 UID，
-///    anticoll 校驗失敗會先重送 [RfidTimingConfig.anticollRetries] 次
+/// 4. REQA (最多 [RfidTimingConfig.reqaAttempts] 次) → anticoll 取 UID，
+///    anticoll 校驗失敗會先重送 [RfidTimingConfig.anticollRetries] 次。
+///    卡片有回應但內容壞掉時 (ATQA 或 UID 校驗錯)，卡片已經在 READY 狀態，
+///    依 ISO 14443-3 它不會再理 REQA / WUPA，所以先把 RF 場關掉 [SimpleMFRC522.fieldResetMs]
+///    再打開讓卡片回到 IDLE，下一次 REQA 才叫得到。
 /// 5. 關天線、RST 拉低 (立即進 power-down，不需要等待)
 ///
 /// 線路異常、晶片無回應或 SPI 寫入錯誤時，會把這顆 RST 重新上電再讀
@@ -112,7 +115,7 @@ class ReaderScanResult {
   /// 這顆總共花的時間 (ms)
   final int elapsedMs;
 
-  /// 最後一次上電裡實際送出的 REQA / WUPA 次數
+  /// 最後一次上電裡實際送出的 REQA 次數
   final int attempts;
 
   /// 暫存器寫入讀回不符而重寫的次數 (線路品質指標，正常應為 0)
@@ -279,6 +282,10 @@ class SimpleMFRC522 {
   /// 重新上電再讀之前，RST 保持拉低的時間 (ms)
   static const int retryPowerDownMs = 2;
 
+  /// 卡片回應壞掉後、重送 REQA 之前，RF 場關閉的時間 (ms)。
+  /// ISO 14443-3 規定場關掉至少 5 ms，場內的卡片才會重置回 IDLE。
+  static const int fieldResetMs = 5;
+
   final int deviceNum;
   final ResetLine resetLine;
   final MFRC522 chip;
@@ -380,10 +387,8 @@ class SimpleMFRC522 {
       var lastStatus = MFRC522Status.notag;
       while (attempts < t.reqaAttempts) {
         attempts++;
-        // 第一次用 REQA；之後改用 WUPA，卡片若已進 HALT 也叫得醒
-        final request = chip.request(
-          attempts == 1 ? PICCCommands.reqidl : PICCCommands.reqall,
-        );
+        // 一律用 REQA：這裡從不送 HLTA，卡片不會進 HALT，WUPA 沒有意義
+        final request = chip.request(PICCCommands.reqidl);
         lastStatus = request.status;
         if (request.status == MFRC522Status.ok) {
           var anticollRetries = 0;
@@ -414,6 +419,15 @@ class SimpleMFRC522 {
         if (lastStatus == MFRC522Status.timeout ||
             lastStatus == MFRC522Status.spiError) {
           break;
+        }
+        // 卡片有回應但內容壞掉 (ATQA 或 UID 校驗錯)：卡片已經在 READY，
+        // 依 ISO 14443-3 它不會再理 REQA。把 RF 場關掉再打開讓它回到 IDLE，
+        // 下一次 REQA 才叫得到；沒回應 (notag) 的卡片本來就在 IDLE，不用重置。
+        if (lastStatus == MFRC522Status.error && attempts < t.reqaAttempts) {
+          if (!await _fieldReset(t)) {
+            lastStatus = MFRC522Status.spiError;
+            break;
+          }
         }
       }
 
@@ -454,6 +468,19 @@ class SimpleMFRC522 {
       }
       resetLine.low();
     }
+  }
+
+  /// 關掉 RF 場 [fieldResetMs] 再打開，讓場內的卡片重置回 IDLE。
+  /// 回 false 代表天線開不回來 (暫存器寫入讀回不符)。
+  Future<bool> _fieldReset(RfidTimingConfig t) async {
+    chip.antennaOff();
+    await _sleep(fieldResetMs);
+    if (!chip.antennaOn()) return false;
+    // ISO 14443-3：場打開後卡片 5 ms 內就緒
+    await _sleep(
+      t.antennaSettleMs > fieldResetMs ? t.antennaSettleMs : fieldResetMs,
+    );
+    return true;
   }
 
   /// 量測這顆的連線品質 (給校正工具用)：

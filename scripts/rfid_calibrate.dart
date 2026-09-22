@@ -8,11 +8,14 @@
 ///   dart run scripts/rfid_calibrate.dart bench [--rounds 10] [--verbose]
 ///   dart run scripts/rfid_calibrate.dart sweep [--rst 5,10,20,50] [--antenna 0,2,5,10] [--rounds 5]
 ///   dart run scripts/rfid_calibrate.dart recommend [--write] [--speeds ...] [--samples N]
-///   dart run scripts/rfid_calibrate.dart optimize [--write] [--sweep-rounds 5] [--verify-rounds 20] [--margin 1] [--skip-link]
+///   dart run scripts/rfid_calibrate.dart optimize [--write [--force]] [--sweep-rounds 5] [--verify-rounds 20] [--margin 1] [--skip-link]
 ///   dart run scripts/rfid_calibrate.dart set key=value [01.key=value ...] [01.clear] [clear]
 ///
 /// 共同選項：
 ///   --file <path>   設定檔路徑。預設看 RFID_TIMING_FILE 環境變數，再來是 ~/Documents/rfid_timing.json
+///                   (跟 app 用同一個函式決定，兩邊讀寫同一個檔案)
+///   --readers 1,2,7 只測某幾顆 (link / bench / sweep / optimize 都支援)；
+///                   沒選到的讀卡機 RST 仍會拉低，bus 上不會有別顆醒著
 ///   --verbose       顯示每顆讀卡機的細節
 ///
 /// 說明文件：documents/RFID_TIMING_TUNING.md
@@ -34,7 +37,14 @@ import 'package:smart_bite/services/simple_mfrc522.dart';
 const List<int> defaultSpeeds = [1000000, 500000, 250000];
 
 Future<void> main(List<String> args) async {
-  final options = _Options.parse(args);
+  final _Options options;
+  try {
+    options = _Options.parse(args);
+  } catch (e) {
+    print('❌ 參數錯誤: $e');
+    print('用 --help 看用法。');
+    exit(1);
+  }
   if (options.help || options.command == null) {
     _printHelp();
     exit(options.help ? 0 : 1);
@@ -95,14 +105,21 @@ Future<void> _bench(_Options options) async {
   final load = await _loadTiming(options);
   _printTiming(load);
   print('');
-  print('▶ 以目前設定跑 ${options.rounds} 輪完整掃描');
+  final configs = _selectedConfigs(options);
+  print('▶ 以目前設定跑 ${options.rounds} 輪完整掃描 (${configs.length} 顆)');
   final service = RFIDPollingService(
     timing: load.config,
     log: options.verbose ? print : null,
   );
-  final cycles = await _runRounds(service, options.rounds, options.verbose);
-  print('');
-  print(RfidCalibration.formatBenchSummary(cycles));
+  final parked = _parkUnselected(configs);
+  try {
+    final cycles =
+        await _runRounds(service, configs, options.rounds, options.verbose);
+    print('');
+    print(RfidCalibration.formatBenchSummary(cycles));
+  } finally {
+    _releaseLines(parked);
+  }
 }
 
 Future<void> _sweep(_Options options) async {
@@ -110,6 +127,7 @@ Future<void> _sweep(_Options options) async {
   final base = load.config;
   final rstList = options.rst ?? [base.rstSettleMs];
   final antennaList = options.antenna ?? [base.antennaSettleMs];
+  final configs = _selectedConfigs(options);
 
   _printTiming(load);
   print('');
@@ -121,24 +139,33 @@ Future<void> _sweep(_Options options) async {
     '各讀卡機有卡次數 (共 ${options.rounds} 輪)',
   );
 
-  for (final rst in rstList) {
-    for (final antenna in antennaList) {
-      final timing = base.copyWith(rstSettleMs: rst, antennaSettleMs: antenna);
-      final service = RFIDPollingService(timing: timing);
-      final cycles = await _runRounds(service, options.rounds, false);
-      final avg =
-          cycles.map((c) => c.totalMs).reduce((a, b) => a + b) / cycles.length;
-      final readerIds =
-          <String>{for (final c in cycles) ...c.readers.keys}.toList()..sort();
-      final counts = readerIds.map((id) {
-        final hits = cycles.where((c) => c.readers[id]?.hasCard == true).length;
-        return '$id:$hits';
-      }).join(' ');
-      print(
-        '${rst.toString().padLeft(7)} ${antenna.toString().padLeft(7)} '
-        '${avg.toStringAsFixed(0).padLeft(11)}  $counts',
-      );
+  final parked = _parkUnselected(configs);
+  try {
+    for (final rst in rstList) {
+      for (final antenna in antennaList) {
+        final timing =
+            base.copyWith(rstSettleMs: rst, antennaSettleMs: antenna);
+        final service = RFIDPollingService(timing: timing);
+        final cycles =
+            await _runRounds(service, configs, options.rounds, false);
+        final avg = cycles.map((c) => c.totalMs).reduce((a, b) => a + b) /
+            cycles.length;
+        final readerIds = <String>{for (final c in cycles) ...c.readers.keys}
+            .toList()
+          ..sort();
+        final counts = readerIds.map((id) {
+          final hits =
+              cycles.where((c) => c.readers[id]?.hasCard == true).length;
+          return '$id:$hits';
+        }).join(' ');
+        print(
+          '${rst.toString().padLeft(7)} ${antenna.toString().padLeft(7)} '
+          '${avg.toStringAsFixed(0).padLeft(11)}  $counts',
+        );
+      }
     }
+  } finally {
+    _releaseLines(parked);
   }
   print('');
   print('選最小但每顆都穩定讀到的組合，再用 set 指令寫入，例如：');
@@ -192,7 +219,8 @@ Future<void> _optimize(_Options options) async {
   final load = await _loadTiming(options);
   _printTiming(load);
   print('');
-  print('▶ 自動最佳化：請先在七個感應器都放上卡片。');
+  final configs = _selectedConfigs(options);
+  print('▶ 自動最佳化：請先在要測的 ${configs.length} 個感應器都放上卡片。');
   if (stdin.hasTerminal) {
     stdout.write('放好後按 Enter 開始 (Ctrl+C 取消)… ');
     stdin.readLineSync();
@@ -207,7 +235,7 @@ Future<void> _optimize(_Options options) async {
     skipLinkStage: options.skipLink,
   );
   final runner = HardwareOptimizerRunner(
-    configs: defaultReaderConfigs,
+    configs: configs,
     base: load.config,
     log: options.verbose ? print : null,
   );
@@ -238,7 +266,13 @@ Future<void> _optimize(_Options options) async {
     },
   );
 
-  final result = await optimizer.run(base: load.config);
+  final parked = _parkUnselected(configs);
+  final OptimizationResult result;
+  try {
+    result = await optimizer.run(base: load.config);
+  } finally {
+    _releaseLines(parked);
+  }
 
   print('');
   print('▶ 結果 (共 ${result.roundsRun} 輪，'
@@ -270,20 +304,41 @@ Future<void> _optimize(_Options options) async {
   if (result.cancelled) return;
   if (!options.write) {
     print('');
-    print('加上 --write 會把 SPI 時脈與每顆的覆寫值寫入設定檔。');
+    print('加上 --write 會把 SPI 時脈與穩定讀卡機的覆寫值寫入設定檔 (其他覆寫不動)。');
+    return;
+  }
+  if (!result.allStable && !options.force) {
+    print('');
+    print('⚠ 讀卡機 ${result.unstableReaderIds.join('、')} 不穩定，沒有寫入。');
+    print('  確認卡片放好後重跑；只想寫入穩定那幾顆的值請加 --force。');
+    exitCode = 1;
     return;
   }
 
   final path = _configPath(options);
   final fileConfig = await _loadFileConfig(path);
-  final merged = fileConfig.copyWith(
-    spiSpeedHz: result.config.spiSpeedHz,
-    readerOverrides: result.config.readerOverrides,
-  );
+  // 逐顆合併：只蓋掉穩定讀卡機掃描過的四個參數，檔案裡其他讀卡機與其他欄位的覆寫維持不變
+  var merged = fileConfig.copyWith(spiSpeedHz: result.config.spiSpeedHz);
+  final updated = <String>[];
+  final kept = <String>[];
+  for (final id in result.deviceIds) {
+    final summary = result.readers[id]!;
+    if (!summary.stable) {
+      kept.add(id);
+      continue;
+    }
+    merged = merged.withReaderOverrides(id, summary.values);
+    updated.add(id);
+  }
   await merged.saveTo(path);
   print('');
   print('✓ 已寫入 $path');
-  print('  app 下次掃描或按「重新載入設定檔」後生效。');
+  if (fileConfig.spiSpeedHz != merged.spiSpeedHz) {
+    print('  SPI 時脈 ${fileConfig.spiSpeedHz} → ${merged.spiSpeedHz} Hz');
+  }
+  if (updated.isNotEmpty) print('  更新覆寫: ${updated.join('、')}');
+  if (kept.isNotEmpty) print('  維持原設定 (不穩定): ${kept.join('、')}');
+  print('  其他讀卡機與欄位的覆寫維持不變。app 下次掃描或按「重新載入設定檔」後生效。');
 }
 
 Future<void> _set(_Options options) async {
@@ -302,9 +357,9 @@ Future<void> _set(_Options options) async {
       continue;
     }
     if (assignment.endsWith('.clear')) {
-      config = config.clearReaderOverrides(
+      config = config.clearReaderOverrides(_normalizeDeviceId(
         assignment.substring(0, assignment.length - '.clear'.length),
-      );
+      ));
       continue;
     }
     final parts = assignment.split('=');
@@ -318,7 +373,7 @@ Future<void> _set(_Options options) async {
     }
     final dot = key.indexOf('.');
     if (dot > 0) {
-      final deviceId = key.substring(0, dot);
+      final deviceId = _normalizeDeviceId(key.substring(0, dot));
       key = key.substring(dot + 1);
       if (!RfidTimingConfig.perReaderKeys.contains(key)) {
         throw ArgumentError(
@@ -376,6 +431,36 @@ String _configPath(_Options options) =>
     options.file ??
     Platform.environment[RfidTimingConfig.fileEnvKey] ??
     RfidTimingConfig.defaultFilePath();
+
+/// `7` → `07`：覆寫的 key 是兩位數的 deviceId，寫成 `7.rstSettleMs` 也要能生效
+String _normalizeDeviceId(String raw) {
+  final number = int.tryParse(raw.trim());
+  return number == null ? raw.trim() : number.toString().padLeft(2, '0');
+}
+
+/// 把沒被選到的讀卡機 RST 拉低並保持住，bus 上才不會有別顆醒著
+/// (Pi 的 GPIO 4 預設是上拉，沒人驅動時那顆 RC522 會醒著搶 MISO)
+List<GpioResetLine> _parkUnselected(List<ReaderConfig> selected) {
+  final selectedPins = selected.map((c) => c.rstPin).toSet();
+  final lines = <GpioResetLine>[];
+  try {
+    for (final config in defaultReaderConfigs) {
+      if (selectedPins.contains(config.rstPin)) continue;
+      lines.add(GpioResetLine(config.rstPin)..open());
+    }
+  } catch (_) {
+    _releaseLines(lines);
+    rethrow;
+  }
+  return lines;
+}
+
+void _releaseLines(List<GpioResetLine> lines) {
+  for (final line in lines) {
+    line.low();
+    line.dispose();
+  }
+}
 
 void _printTiming(RfidTimingLoadResult load) {
   print('設定來源: ${load.sourceDescription}');
@@ -456,12 +541,13 @@ Future<List<LinkMeasurement>> _measureLinks(
 
 Future<List<ScanCycleResult>> _runRounds(
   RFIDPollingService service,
+  List<ReaderConfig> configs,
   int rounds,
   bool verbose,
 ) async {
   final cycles = <ScanCycleResult>[];
   for (var i = 1; i <= rounds; i++) {
-    final cycle = await service.performOneLoopCycles(defaultReaderConfigs);
+    final cycle = await service.performOneLoopCycles(configs);
     cycles.add(cycle);
     if (verbose) {
       print('第 $i 輪: ${cycle.totalMs} ms，卡片 ${cycle.cardCount}，'
@@ -486,6 +572,7 @@ class _Options {
   bool help = false;
   bool verbose = false;
   bool write = false;
+  bool force = false;
   String? file;
   List<int> speeds = defaultSpeeds;
   int samples = 200;
@@ -506,6 +593,7 @@ class _Options {
     'v',
     'write',
     'w',
+    'force',
     'skip-link',
   };
 
@@ -548,6 +636,8 @@ class _Options {
       case 'write':
       case 'w':
         write = true;
+      case 'force':
+        force = true;
       case 'file':
         file = _require(name, value);
       case 'speeds':
@@ -630,15 +720,18 @@ RC522 輪巡校正工具 (請先關閉 Smart Bite app 再執行)
   sweep                    掃描不同 rstSettleMs / antennaSettleMs 組合的讀卡成功率 (請先放卡片)
                            選項: --rst 5,10,20,50  --antenna 0,2,5,10  --rounds 5
   recommend                量測後推薦 spiSpeedHz 與 rstSettleMs；加 --write 寫入設定檔
-  optimize                 自動最佳化：連線檢測後，每顆讀卡機各自由大往小找最小可靠值
-                           (七顆都要放卡片)；加 --write 寫入設定檔
+  optimize                 自動最佳化：連線檢測後，每顆讀卡機從目前值 (或候選最大值) 往小找
+                           最小可靠值，讀不到時先往上放寬 (七顆都要放卡片)
+                           加 --write 只寫入 SPI 時脈與穩定讀卡機的四個參數，其他覆寫不動；
+                           有讀卡機不穩定時需要 --force 才寫
                            選項: --sweep-rounds 5  --verify-rounds 20  --margin 1  --skip-link
   set key=value ...        直接修改設定檔，例如 set rstSettleMs=20 antennaSettleMs=5
-                           單顆覆寫: set 07.rstSettleMs=30 07.antennaSettleMs=10
+                           單顆覆寫: set 07.rstSettleMs=30 07.antennaSettleMs=10 (7. 也可以)
                            清除覆寫: set 07.clear 或 set clear
 
 共同選項:
-  --file <path>            設定檔路徑 (預設: \$RFID_TIMING_FILE 或 ~/Documents/rfid_timing.json)
+  --file <path>            設定檔路徑 (預設: \$RFID_TIMING_FILE 或 ~/Documents/rfid_timing.json，跟 app 相同)
+  --readers 1,2,7          只測某幾顆 (link / bench / sweep / optimize)，其餘 RST 仍拉低
   --verbose, -v            顯示細節
   --help, -h               顯示這份說明
 

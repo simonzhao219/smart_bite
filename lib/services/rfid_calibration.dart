@@ -58,7 +58,9 @@ class RfidCalibration {
 
   /// 從連線量測推薦設定。
   ///
-  /// - `spiSpeedHz`：所有讀卡機都零錯誤的最高時脈；都有錯誤時取總錯誤數最少的時脈
+  /// - `spiSpeedHz`：所有讀卡機都零錯誤的最高時脈；都有錯誤時，先取「就緒的讀卡機最多」
+  ///   的時脈，再取錯誤總數最少的 (同分取較高時脈)。讀不到 VersionReg 比任何錯誤率都嚴重，
+  ///   不能只算成一個錯誤，否則「完全讀不到」的時脈會贏過「就緒但有兩個位元錯誤」的時脈
   /// - `rstSettleMs`：所有讀卡機就緒時間的最大值 × 2 + 5 ms，最低 10 ms，
   ///   而且不會比 [base] 目前的值更長 (校正只往下修，保守值仍以 datasheet 為準)
   static CalibrationRecommendation recommend({
@@ -106,21 +108,22 @@ class RfidCalibration {
       }
     }
     if (chosenSpeed == null) {
-      // 沒有全乾淨的時脈：取錯誤總數最少的 (同分取較高時脈)
-      var bestErrors = -1;
+      // 沒有全乾淨的時脈：就緒的讀卡機越多越好，其次錯誤總數越少越好，
+      // 同分取較高時脈 (speeds 已由高到低排序)
+      int readyCount(int speed) => bySpeed[speed]!.where((p) => p.ready).length;
+      int errorCount(int speed) =>
+          bySpeed[speed]!.fold<int>(0, (sum, p) => sum + p.mismatches);
       for (final speed in speeds) {
-        final probes = bySpeed[speed]!;
-        final errors = probes.fold<int>(
-          0,
-          (sum, p) => sum + (p.ready ? p.mismatches : p.samples + 1),
-        );
-        if (bestErrors < 0 || errors < bestErrors) {
-          bestErrors = errors;
+        final best = chosenSpeed;
+        if (best == null ||
+            readyCount(speed) > readyCount(best) ||
+            (readyCount(speed) == readyCount(best) &&
+                errorCount(speed) < errorCount(best))) {
           chosenSpeed = speed;
         }
       }
-      notes.add('沒有任何 SPI 時脈是全部零錯誤，先取錯誤最少的 $chosenSpeed Hz；'
-          '建議縮短或改善 SCK/MISO/MOSI 走線後再校正一次');
+      notes.add('沒有任何 SPI 時脈是全部零錯誤，先取就緒讀卡機最多、錯誤最少的 '
+          '$chosenSpeed Hz；建議縮短或改善 SCK/MISO/MOSI 走線後再校正一次');
     } else {
       notes.add('SPI 時脈 $chosenSpeed Hz：所有讀卡機讀寫零錯誤');
     }

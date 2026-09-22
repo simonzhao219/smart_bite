@@ -94,8 +94,28 @@ void main() {
       );
       expect(rec.allReadersReady, isFalse);
       expect(rec.notes.join('\n'), contains('07'));
-      // 未就緒的那顆不算乾淨，所以沒有全乾淨的時脈，退回錯誤最少的
-      expect(rec.config.spiSpeedHz, anyOf(1000000, 500000));
+      // 未就緒的那顆不算乾淨，所以沒有全乾淨的時脈；兩個時脈就緒數與錯誤數都相同，
+      // 同分取較高時脈
+      expect(rec.config.spiSpeedHz, 1000000);
+    });
+
+    test('退路計分：就緒的讀卡機越多越優先，「完全讀不到」不能贏過「就緒但有錯」', () {
+      // 07 在 1 MHz 完全讀不到 VersionReg，在 500 kHz 就緒但有 2 個位元錯誤；
+      // 舊的計分把未就緒算成 1 個錯誤，會反過來選 1 MHz
+      final measurements = [
+        measure(deviceId: '01', speed: 1000000, readyMs: 2),
+        measure(deviceId: '07', speed: 1000000, readyMs: null, version: 0x00),
+        measure(deviceId: '01', speed: 500000, readyMs: 2),
+        measure(deviceId: '07', speed: 500000, readyMs: 3, mismatches: 2),
+      ];
+      final rec = RfidCalibration.recommend(
+        base: RfidTimingConfig.defaults,
+        measurements: measurements,
+      );
+      expect(rec.config.spiSpeedHz, 500000);
+      expect(rec.allReadersReady, isTrue);
+      expect(rec.notes.join('\n'), contains('就緒'));
+      expect(rec.notes.join('\n'), contains('走線'));
     });
 
     test('沒有量測資料時維持原設定', () {

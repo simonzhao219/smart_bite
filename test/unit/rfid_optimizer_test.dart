@@ -204,12 +204,145 @@ void main() {
 
       expect(result.readers['05']!.stable, isFalse);
       expect(result.readers['05']!.note, contains('卡片'));
+      // 放寬到升階清單的頂 (RST 500) 仍讀不到才放棄
+      expect(result.readers['05']!.note, contains('RST 500'));
       expect(result.readers['05']!.values['rstSettleMs'], 40);
       expect(result.config.readerOverrides.containsKey('05'), isFalse);
       expect(result.readers['01']!.stable, isTrue);
       expect(result.config.forReader('01').rstSettleMs, 15);
       expect(result.unstableReaderIds, ['05']);
       expect(result.allStable, isFalse);
+      expect(result.notes.join('\n'), contains('放寬'));
+    });
+
+    test('base 既有的覆寫會保留：不穩定的讀卡機、沒掃描的欄位、沒接的讀卡機都不動', () async {
+      final runner = FakeRunner({
+        '01': const FakeReaderModel(minRst: 10),
+        '05': const FakeReaderModel(minRst: 999),
+      });
+      const base = RfidTimingConfig(
+        readerOverrides: {
+          '01': {'readerRetries': 3, 'commDeadlineMs': 60},
+          '05': {'rstSettleMs': 80, 'readerRetries': 3},
+          '09': {'antennaSettleMs': 7},
+        },
+      );
+      final result =
+          await RfidOptimizer(runner, options: testOptions).run(base: base);
+
+      // 01 穩定：掃描過的四個參數蓋上去，其他欄位保留
+      final o01 = result.config.readerOverrides['01']!;
+      expect(o01['readerRetries'], 3);
+      expect(o01['commDeadlineMs'], 60);
+      expect(o01['rstSettleMs'], 15);
+      expect(o01.containsKey('linkCheckTimeoutMs'), isFalse);
+      // 05 不穩定：手動設的覆寫原封不動 (文件說的「維持原設定」)
+      expect(result.config.readerOverrides['05'], {
+        'rstSettleMs': 80,
+        'readerRetries': 3,
+      });
+      expect(result.readers['05']!.values['rstSettleMs'], 80);
+      // 09 沒接在這台機器上，也不能被清掉
+      expect(result.config.readerOverrides['09'], {'antennaSettleMs': 7});
+      // 最終設定的量測用欄位還原成 base 的值
+      expect(result.config.forReader('01').linkCheckTimeoutMs,
+          base.linkCheckTimeoutMs);
+      expect(result.config.forReader('01').readerRetries, 3);
+    });
+
+    test('量測時關掉連線檢查保險與重新上電重讀，命中只算沒有重讀的那輪', () async {
+      final runner = FakeRunner({'01': const FakeReaderModel(minRst: 10)});
+      const base = RfidTimingConfig(
+        linkCheckTimeoutMs: 80,
+        readerRetries: 2,
+        readerOverrides: {
+          '01': {'readerRetries': 3},
+        },
+      );
+      final result =
+          await RfidOptimizer(runner, options: testOptions).run(base: base);
+
+      expect(runner.scanned, isNotEmpty);
+      for (final timing in runner.scanned) {
+        final t = timing.forReader('01');
+        expect(t.linkCheckTimeoutMs, 0);
+        expect(t.readerRetries, 0);
+      }
+      final after = result.config.forReader('01');
+      expect(after.linkCheckTimeoutMs, 80);
+      expect(after.readerRetries, 3);
+      expect(result.config.readerOverrides['01']!.containsKey('readerRetries'),
+          isTrue);
+      expect(
+        result.config.readerOverrides['01']!.containsKey('linkCheckTimeoutMs'),
+        isFalse,
+      );
+    });
+
+    test('靠重新上電重讀才讀到的那輪不算命中', () async {
+      // 假讀卡機：每次都要重讀一次才讀到 → 掃描時全部不算命中 → 全部不穩定
+      final runner = _RereadRunner({'01': const FakeReaderModel()});
+      final result = await RfidOptimizer(runner, options: testOptions)
+          .run(base: RfidTimingConfig.defaults);
+      expect(result.allStable, isFalse);
+      expect(result.config, RfidTimingConfig.defaults);
+    });
+
+    test('搜尋起點是目前生效的值：手動調大過的讀卡機不會被拿較小的值當起點', () async {
+      // 07 需要 RST 70 ms；目前設定 80 (比候選最大值 50 大)，起點就是 80
+      final runner = FakeRunner({
+        '01': const FakeReaderModel(minRst: 10),
+        '07': const FakeReaderModel(minRst: 70),
+      });
+      const base = RfidTimingConfig(
+        readerOverrides: {
+          '07': {'rstSettleMs': 80},
+        },
+      );
+      final progress = <OptimizerProgress>[];
+      final result = await RfidOptimizer(
+        runner,
+        options: testOptions,
+        onProgress: progress.add,
+      ).run(base: base);
+
+      expect(result.allStable, isTrue);
+      // 80 可過、50 不行 → 維持 80 (餘裕不會超過起點)
+      expect(result.config.forReader('07').rstSettleMs, 80);
+      expect(result.config.forReader('01').rstSettleMs, 15);
+      // 07 從頭到尾沒有用比 80 小以外、比 50 大的奇怪值；第一輪就是 80
+      final firstScan = runner.scanned.first.forReader('07');
+      expect(firstScan.rstSettleMs, 80);
+      expect(result.notes.join('\n'), isNot(contains('放寬')));
+      // 進度單調不減、最後 100%
+      for (var i = 1; i < progress.length; i++) {
+        expect(progress[i].overallDone,
+            greaterThanOrEqualTo(progress[i - 1].overallDone));
+      }
+      expect(progress.last.fraction, 1);
+    });
+
+    test('起點讀不到時往上放寬，找得到「需要更長等待」的解', () async {
+      // 03 需要 RST 150 ms：50 不行 → 放寬到 100 不行 → 200 可以
+      final runner = FakeRunner({
+        '01': const FakeReaderModel(minRst: 10),
+        '03': const FakeReaderModel(minRst: 150),
+      });
+      final result = await RfidOptimizer(runner, options: testOptions)
+          .run(base: RfidTimingConfig.defaults);
+
+      expect(result.allStable, isTrue);
+      final r03 = result.config.forReader('03');
+      // rst: 200 可過、100 不行 → 維持 200 (餘裕不超過放寬後的起點)
+      expect(r03.rstSettleMs, 200);
+      // 其他三個參數被一起放寬後，掃描階段再各自往下走回來
+      expect(r03.antennaSettleMs, 2);
+      expect(r03.reqaTimeoutMs, 10);
+      expect(r03.reqaAttempts, 1);
+      // 01 不受影響
+      expect(result.config.forReader('01').rstSettleMs, 15);
+      expect(result.notes.join('\n'), contains('放寬'));
+      expect(result.readers['03']!.note, isNull);
     });
 
     test('連線檢測讀不到 VersionReg 的讀卡機不參與搜尋', () async {
@@ -308,6 +441,39 @@ void main() {
       expect(fixed.marginSteps, 0);
     });
 
+    test('升階值由小到大、去重，空清單代表不放寬', () {
+      const options = RfidOptimizerOptions(
+        rstEscalation: [500, 100, 100, 200],
+        reqaAttemptEscalation: [0, 4, 3],
+        antennaEscalation: [],
+      );
+      final fixed = options.validated();
+      expect(fixed.rstEscalation, [100, 200, 500]);
+      expect(fixed.reqaAttemptEscalation, [3, 4]);
+      expect(fixed.antennaEscalation, isEmpty);
+      expect(fixed.maxEscalationSteps, 3);
+      expect(RfidOptimizerOptions.defaults.maxEscalationSteps, 3);
+    });
+
+    test('不放寬時，起點讀不到的讀卡機直接標為不穩定', () async {
+      final runner = FakeRunner({
+        '01': const FakeReaderModel(minRst: 10),
+        '03': const FakeReaderModel(minRst: 150),
+      });
+      final result = await RfidOptimizer(
+        runner,
+        options: testOptions.copyWith(
+          rstEscalation: [],
+          antennaEscalation: [],
+          reqaTimeoutEscalation: [],
+          reqaAttemptEscalation: [],
+        ),
+      ).run(base: RfidTimingConfig.defaults);
+      expect(result.readers['03']!.stable, isFalse);
+      expect(result.readers['03']!.note, contains('RST 50'));
+      expect(result.readers['01']!.stable, isTrue);
+    });
+
     test('JSON 往返', () {
       const options = RfidOptimizerOptions(
         spiSpeeds: [500000],
@@ -319,9 +485,11 @@ void main() {
       expect(restored.sweepRounds, 7);
       expect(restored.skipLinkStage, isTrue);
       expect(restored.rstCandidates, options.rstCandidates);
+      expect(restored.rstEscalation, options.rstEscalation);
+      expect(restored.reqaAttemptEscalation, options.reqaAttemptEscalation);
     });
 
-    test('maxSweepRounds 是每個參數階數的總和乘輪數', () {
+    test('maxSweepRounds 是每個參數一般階數的總和乘輪數 (不含升階)', () {
       const options = RfidOptimizerOptions.defaults;
       // (5-1) + (5-1) + (4-1) + (2-1) = 12 階 × 5 輪
       expect(options.maxSweepRounds, 60);
@@ -370,4 +538,21 @@ void main() {
       expect(restored.fraction, 0.25);
     });
   });
+}
+
+/// 每一輪都要重新上電重讀一次才讀到卡片的假硬體
+class _RereadRunner extends FakeRunner {
+  _RereadRunner(super.models);
+
+  @override
+  Future<ScanCycleResult> scan(RfidTimingConfig timing) async {
+    final cycle = await super.scan(timing);
+    return ScanCycleResult(
+      totalMs: cycle.totalMs,
+      readers: {
+        for (final entry in cycle.readers.entries)
+          entry.key: entry.value.copyWith(rereads: 1),
+      },
+    );
+  }
 }

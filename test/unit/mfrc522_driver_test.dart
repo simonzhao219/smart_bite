@@ -54,6 +54,10 @@ class FakeMfrc522Transport implements Mfrc522Transport {
   /// 這些暫存器的寫入永遠寫不進去
   Set<int> deadRegisters = {};
 
+  /// 每次 transceive 的第一次 ComIrqReg 讀取卡這麼久才回來，
+  /// 模擬 isolate 在晶片 timer 已經響了之後才被排程回來
+  int stallFirstIrqReadMs = 0;
+
   final Map<int, int> registers = {};
   final List<(int, int)> writes = [];
   int reads = 0;
@@ -81,6 +85,10 @@ class FakeMfrc522Transport implements Mfrc522Transport {
       case MFRC522Registers.versionReg:
         return version;
       case MFRC522Registers.comIrqReg:
+        if (_irqIndex == 0 && stallFirstIrqReadMs > 0) {
+          final stall = Stopwatch()..start();
+          while (stall.elapsedMilliseconds < stallFirstIrqReadMs) {}
+        }
         final irqReads = _exchange.irqReads;
         final value = irqReads[_irqIndex.clamp(0, irqReads.length - 1)];
         _irqIndex++;
@@ -217,6 +225,33 @@ void main() {
       expect(reply.status, MFRC522Status.notag);
     });
 
+    test('期限到了之後會再讀最後一次旗標：系統卡頓不會把空的讀卡機判成無回應', () {
+      // 第一次讀 ComIrqReg 卡 30 ms (期限只有 5 ms) 才回 0x00，
+      // 晶片其實早就舉起 TimerIRq；最後一次讀取要能看到它並回 notag
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange(irqReads: [0x00, 0x01]),
+        ],
+      )..stallFirstIrqReadMs = 30;
+      final chip = MFRC522(bus, commDeadlineMs: 5);
+      final reply = chip.communicate(MFRC522Commands.transceive, [0x26]);
+      expect(reply.status, MFRC522Status.notag);
+    });
+
+    test('ErrIRq 舉起就離開並回 error，不等到期限', () {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange(irqReads: [0x02], error: 0x08),
+        ],
+      );
+      final chip = MFRC522(bus, commDeadlineMs: 200);
+      final stopwatch = Stopwatch()..start();
+      final reply = chip.communicate(MFRC522Commands.transceive, [0x26]);
+      stopwatch.stop();
+      expect(reply.status, MFRC522Status.error);
+      expect(stopwatch.elapsedMilliseconds, lessThan(150));
+    });
+
     test('稍後才完成的回應也能收到', () {
       final bus = FakeMfrc522Transport(
         exchanges: const [
@@ -346,6 +381,46 @@ void main() {
       expect(bus.registers[MFRC522Registers.modeReg], 0x3D);
     });
 
+    test('antennaOn 一律寫 0x83 並驗證，讀回值被干擾也不會跳過', () {
+      final bus = FakeMfrc522Transport();
+      // 讀回被干擾成 0xFF：舊版會以為天線已經開了而直接 return
+      bus.registers[MFRC522Registers.txControlReg] = 0xFF;
+      final chip = MFRC522(bus);
+      expect(chip.antennaOn(), isTrue);
+      expect(bus.wrote(MFRC522Registers.txControlReg, 0x83), isTrue);
+      expect(bus.registers[MFRC522Registers.txControlReg], 0x83);
+      expect(chip.verifyRetries, 0);
+
+      // 寫不進去時回 false，而不是回報乾淨的「沒有卡片」
+      final dead = FakeMfrc522Transport()
+        ..deadRegisters = {MFRC522Registers.txControlReg};
+      expect(MFRC522(dead, writeVerifyRetries: 1).antennaOn(), isFalse);
+    });
+
+    test('writeVerifyRetries = 0 是只寫不驗證，相容晶片讀回不同也不算錯', () {
+      final bus = FakeMfrc522Transport()
+        ..deadRegisters = {
+          MFRC522Registers.txControlReg,
+          MFRC522Registers.modeReg,
+        };
+      final chip = MFRC522(bus, writeVerifyRetries: 0);
+      expect(chip.configure(reqaTimeoutMs: 25), isTrue);
+      expect(chip.verifyRetries, 0);
+      // 有寫、沒讀回
+      expect(bus.wrote(MFRC522Registers.txControlReg, 0x83), isTrue);
+      expect(bus.reads, 0);
+      // 送指令也一樣：FIFO 檢查也關掉
+      final reply = MFRC522(
+        FakeMfrc522Transport(
+          exchanges: const [
+            FakeExchange.ok([0x04, 0x00])
+          ],
+        )..deadRegisters = {MFRC522Registers.bitFramingReg},
+        writeVerifyRetries: 0,
+      ).communicate(MFRC522Commands.transceive, [0x26]);
+      expect(reply.status, MFRC522Status.ok);
+    });
+
     test('antennaOff 清掉 TX1/TX2', () {
       final bus = FakeMfrc522Transport();
       bus.registers[MFRC522Registers.txControlReg] = 0x83;
@@ -422,7 +497,7 @@ void main() {
           bus.wrote(MFRC522Registers.fifoDataReg, PICCCommands.reqidl), isTrue);
     });
 
-    test('沒有卡片：REQA 會重試到設定的次數，第二次起用 WUPA', () async {
+    test('沒有卡片：REQA 會重試到設定的次數，一律用 REQA，不做 RF 場重置', () async {
       final bus = FakeMfrc522Transport(
         exchanges: const [FakeExchange.noTag()],
       );
@@ -434,8 +509,50 @@ void main() {
       expect(result.attempts, fastTiming.reqaAttempts);
       expect(bus.transceiveCount, fastTiming.reqaAttempts);
       expect(result.error, isNull);
-      expect(
-          bus.wrote(MFRC522Registers.fifoDataReg, PICCCommands.reqall), isTrue);
+      // 沒送過 HLTA，卡片不會在 HALT，WUPA 沒有意義
+      expect(bus.wrote(MFRC522Registers.fifoDataReg, PICCCommands.reqall),
+          isFalse);
+      // 沒回應的卡片本來就在 IDLE：天線只在 configure 開一次
+      expect(_antennaOnCount(bus), 1);
+    });
+
+    test('ATQA 壞掉 (卡片已進 READY)：先關掉再打開 RF 場，第二次 REQA 才叫得到', () async {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04]), // ATQA 只有 8 bit → error
+          FakeExchange.ok([0x04, 0x00]),
+          FakeExchange.ok([...cardUid, cardBcc]),
+        ],
+      );
+      final result = await reader(bus).scanOnce();
+
+      expect(result.status, ReaderScanStatus.card);
+      expect(result.tagId, 'A22038F6');
+      expect(result.attempts, 2);
+      // configure 開一次、場重置再開一次；中間有關過
+      expect(_antennaOnCount(bus), 2);
+      final writes = bus.writes;
+      final firstOn = writes.indexOf((MFRC522Registers.txControlReg, 0x83));
+      final off =
+          writes.indexOf((MFRC522Registers.txControlReg, 0x80), firstOn);
+      final secondOn =
+          writes.indexOf((MFRC522Registers.txControlReg, 0x83), off);
+      expect(off, greaterThan(firstOn));
+      expect(secondOn, greaterThan(off));
+      expect(bus.wrote(MFRC522Registers.fifoDataReg, PICCCommands.reqall),
+          isFalse);
+    });
+
+    test('場重置後天線開不回來：回 spiError', () async {
+      final bus = _DieAfterFirstAntennaOn(
+        exchanges: const [
+          FakeExchange.ok([0x04]),
+          FakeExchange.ok([0x04, 0x00]),
+        ],
+      );
+      final result = await reader(bus).scanOnce();
+      expect(result.status, ReaderScanStatus.spiError);
+      expect(result.attempts, 1);
     });
 
     test('第二次 REQA 才成功', () async {
@@ -466,7 +583,7 @@ void main() {
       expect(bus.transceiveCount, 3);
     });
 
-    test('anticollRetries = 0 時退回外圈重做 REQA/WUPA', () async {
+    test('anticollRetries = 0 時先重置 RF 場，再退回外圈重做 REQA', () async {
       final bus = FakeMfrc522Transport(
         exchanges: const [
           FakeExchange.ok([0x04, 0x00]),
@@ -482,6 +599,21 @@ void main() {
       expect(result.status, ReaderScanStatus.card);
       expect(result.attempts, 2);
       expect(bus.transceiveCount, 4);
+      expect(_antennaOnCount(bus), 2);
+    });
+
+    test('最後一次 REQA 失敗後不再重置 RF 場', () async {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04])
+        ], // 每次 ATQA 都壞
+      );
+      final result = await reader(bus).scanOnce();
+      expect(result.status, ReaderScanStatus.noCard);
+      expect(result.attempts, fastTiming.reqaAttempts);
+      expect(result.error, contains('error'));
+      // 兩次 REQA 之間重置一次，最後一次失敗後不再重置
+      expect(_antennaOnCount(bus), fastTiming.reqaAttempts);
     });
 
     test('VersionReg 讀不到：直接回線路異常，不送 REQA，RST 仍會拉低', () async {
@@ -555,7 +687,7 @@ void main() {
       expect(result.linkOk, isFalse);
       expect(result.attempts, 1);
       expect(result.error, contains('comm_timeout'));
-      // 期限 = max(commDeadlineMs, reqaTimeoutMs + 10) = 11 ms，整體遠小於舊版的數百 ms
+      // 期限 = max(commDeadlineMs, reqaTimeoutMs + 25) = 26 ms，整體遠小於舊版的數百 ms
       expect(stopwatch.elapsedMilliseconds, lessThan(150));
     });
 
@@ -691,6 +823,30 @@ void main() {
       expect(result.linkOk, isFalse);
     });
   });
+}
+
+/// TxControlReg 寫成 0x83 (開天線) 的次數
+int _antennaOnCount(FakeMfrc522Transport bus) => bus.writes
+    .where((w) => w.$1 == MFRC522Registers.txControlReg && w.$2 == 0x83)
+    .length;
+
+/// 第一次開天線正常，之後 TxControlReg 就寫不進去 (模擬場重置時線路出錯)
+class _DieAfterFirstAntennaOn extends FakeMfrc522Transport {
+  int _antennaOns = 0;
+
+  _DieAfterFirstAntennaOn({required super.exchanges});
+
+  @override
+  void writeRegister(int register, int value) {
+    if (register == MFRC522Registers.txControlReg && value == 0x83) {
+      _antennaOns++;
+      if (_antennaOns > 1) {
+        writes.add((register, value));
+        return;
+      }
+    }
+    super.writeRegister(register, value);
+  }
 }
 
 class _ThrowingTransport implements Mfrc522Transport {

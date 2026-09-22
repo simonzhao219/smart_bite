@@ -14,7 +14,7 @@ void main() {
       expect(config.antennaSettleMs, 5);
       expect(config.reqaTimeoutMs, 25);
       expect(config.reqaAttempts, 2);
-      expect(config.commDeadlineMs, 36);
+      expect(config.commDeadlineMs, 50);
       expect(config.interReaderGapMs, 1);
       expect(config.postScanSettleMs, 0);
       expect(config.scanTimeoutSec, 10);
@@ -30,16 +30,19 @@ void main() {
           containsAll(RfidTimingConfig.keys));
     });
 
-    test('effectiveCommDeadlineMs 至少比 REQA 逾時多 10 ms', () {
-      expect(RfidTimingConfig.defaults.effectiveCommDeadlineMs, 36);
-      const slow = RfidTimingConfig(reqaTimeoutMs: 100, commDeadlineMs: 36);
-      expect(slow.effectiveCommDeadlineMs, 110);
+    test('effectiveCommDeadlineMs 至少比 REQA 逾時多 25 ms', () {
+      expect(RfidTimingConfig.commDeadlineMarginMs, 25);
+      expect(RfidTimingConfig.defaults.effectiveCommDeadlineMs, 50);
+      const slow = RfidTimingConfig(reqaTimeoutMs: 100, commDeadlineMs: 50);
+      expect(slow.effectiveCommDeadlineMs, 125);
+      const tight = RfidTimingConfig(reqaTimeoutMs: 25, commDeadlineMs: 30);
+      expect(tight.effectiveCommDeadlineMs, 50);
     });
 
     test('整輪逾時至少是最壞情況的兩倍', () {
       const config = RfidTimingConfig.defaults;
-      // 最壞情況每顆: (50 + 50 + 5 + 36×2 + 4) × (1 + 1 次重讀) + 1 = 363 ms
-      expect(config.estimateWorstCaseScanMs(1), 363);
+      // 最壞情況每顆: (50 + 50 + 5 + 50×2 + 4) × (1 + 1 次重讀) + 1 = 419 ms
+      expect(config.estimateWorstCaseScanMs(1), 419);
       expect(config.scanTimeoutFor(7), const Duration(seconds: 10));
 
       const slow = RfidTimingConfig(
@@ -247,6 +250,18 @@ void main() {
       );
       expect(result.fileFound, isTrue);
       expect(result.config, config);
+      // 原子寫入：暫存檔已經 rename 走，不會留下
+      expect(File('$path.tmp').existsSync(), isFalse);
+
+      // 覆寫既有檔案也一樣，內容是新的
+      const updated = RfidTimingConfig(rstSettleMs: 30, spiSpeedHz: 250000);
+      await updated.saveTo(path);
+      final reloaded = await RfidTimingConfig.load(
+        filePath: path,
+        environment: const {},
+      );
+      expect(reloaded.config, updated);
+      expect(File('$path.tmp').existsSync(), isFalse);
     });
 
     test('defaultFilePath 放在 HOME/Documents 底下', () {

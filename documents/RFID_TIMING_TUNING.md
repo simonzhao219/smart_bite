@@ -39,11 +39,16 @@ UI 分不出是沒放餐盤還是線有問題。
      最多再等 `linkCheckTimeoutMs`，仍讀不到就回報 **線路異常**，不再送 REQA。
    - 設定暫存器、開天線，等 `antennaSettleMs` 讓卡片上電。
    - 送 REQA，最多 `reqaAttempts` 次；有卡就做 anticoll 取 UID。
+     卡片有回應但內容壞掉時 (ATQA 或 UID 校驗錯)，卡片已經在 READY 狀態，
+     依 ISO 14443-3 它不會再理 REQA，所以先把 RF 場關掉 5 ms 再打開讓卡片回到 IDLE，
+     下一次 REQA 才叫得到。沒回應 (notag) 的卡片本來就在 IDLE，直接再送 REQA。
    - 關天線、RST 拉低。進 power-down 是立即的，不需要等待。
 4. 釋放 GPIO 與 SPI。
 
-等 IRQ 的迴圈改用牆鐘時間當上限 (`commDeadlineMs`，至少 `reqaTimeoutMs + 10`)，
-線路再差也不會把掃描拖長，而是回報「晶片無回應」。
+等 IRQ 的迴圈改用牆鐘時間當上限 (`commDeadlineMs`，至少 `reqaTimeoutMs + 25`)，
+線路再差也不會把掃描拖長，而是回報「晶片無回應」。期限到了之後會再讀最後一次旗標，
+kiosk 同時在繪圖或列印、isolate 晚了十幾 ms 才被排程回來時，已經響的 timer 不會被
+誤判成無回應；ErrIRq 舉起也會立刻離開，不用等到期限。
 
 每顆的結果分五類，會顯示在設定頁的讀卡機列表與訂單頁的提示：
 
@@ -67,7 +72,7 @@ UI 分不出是沒放餐盤還是線有問題。
 | `antennaSettleMs` | 5 | 是 | ISO 14443-3 要求卡片在場開啟後 5 ms 內就緒 |
 | `reqaTimeoutMs` | 25 | 是 | Arduino library 的 timer 設定 |
 | `reqaAttempts` | 2 | 是 | 卡片剛上電偶爾會漏掉第一次 REQA |
-| `commDeadlineMs` | 36 | 是 | Arduino library 的牆鐘上限 |
+| `commDeadlineMs` | 50 | 是 | 至少 `reqaTimeoutMs + 25`，留給 isolate 被排程回來的時間 |
 | `interReaderGapMs` | 1 | 否 | 兩顆之間的間隔 |
 | `postScanSettleMs` | 0 | 否 | 舊版為 500 |
 | `scanTimeoutSec` | 10 | 否 | 整輪逾時，會自動至少是最壞情況的兩倍 |
@@ -91,7 +96,12 @@ UI 分不出是沒放餐盤還是線有問題。
 設定檔是 JSON，路徑依序為：
 
 1. 環境變數 `RFID_TIMING_FILE` 指定的路徑
-2. app 的文件目錄，Raspberry Pi OS 上是 `~/Documents/rfid_timing.json`
+2. `~/Documents/rfid_timing.json`
+
+app 與 CLI 都用 `RfidTimingConfig.defaultFilePath()` 決定第 2 項，不看語系與 xdg 設定，
+兩邊一定讀寫同一個檔案。寫入時先寫到 `rfid_timing.json.tmp` 再 rename，
+kiosk 硬關機也不會留下截斷的檔案；萬一檔案真的壞了，app 會退回預設值，
+設定頁的「設定來源」會用紅字顯示錯誤。
 
 範例 (`~/Documents/rfid_timing.json`)：
 
@@ -134,8 +144,10 @@ app 在第一次掃描時載入設定。改了檔案之後，到設定頁按「�
 | 自動最佳化 | 七顆都放卡片後執行第 5 節的演算法，顯示進度，結束後列出每顆的建議值與驗證結果，按「套用並儲存」寫入 |
 | 重新載入設定檔 | 手動改過 JSON 之後重新讀取 |
 
-掃描與校正互斥：校正進行中不能掃描，掃描中也不能開始校正。
-所有硬體操作都在背景 isolate 執行，UI 不會卡住。
+掃描與校正互斥 (manager 層保證)：校正進行中的掃描會被略過，掃描還在跑時開始校正會直接報錯。
+所有硬體操作都在背景 isolate 執行，UI 不會卡住；校正 isolate 若卡住或異常結束，
+10 分鐘後會被中止並解除「校正中」，設定頁不會永遠鎖住。
+連線檢測與自動最佳化的結果畫面在「套用」失敗 (例如唯讀檔案系統) 時會留著，錯誤顯示在表格上方，可以再按一次。
 
 ## 5. 自動最佳化演算法
 
@@ -146,20 +158,36 @@ app 在第一次掃描時載入設定。改了檔案之後，到設定頁按「�
    量每顆的 VersionReg 就緒時間與 200 次寫入讀回的錯誤數。
    取「所有讀卡機都零錯誤」的最高時脈；都有錯誤就取錯誤最少的並提醒檢查走線。
    每顆的就緒時間決定它 `rstSettleMs` 候選值的下限 (就緒時間 × 2 + 5 ms，最低 10 ms)。
-2. **確認階段**：用最保守的候選值跑 N 輪。讀不到卡的讀卡機標為「不穩定」，
+2. **確認階段**：每顆從「起點值」跑 N 輪。起點 = max(目前生效的值, 一般候選值的最大值)，
+   所以手動調大過的讀卡機 (例如線最長那顆設了 `rstSettleMs: 80`) 不會被拿 50 去測。
+   讀不到卡的讀卡機把四個參數一起往上放寬再確認：RST 100 → 200 → 500 ms、
+   天線 50 → 100 → 200 ms、REQA 逾時 50 → 100 ms、次數 3 → 4；
+   「需要更長等待」的解因此也找得到。放寬到底仍讀不到才標為「不穩定」，
    不參與後面的搜尋並維持原設定，通常是卡片沒放好或線路問題。
-3. **掃描階段**：依序對 `rstSettleMs` (50 → 30 → 20 → 15 → 10)、
-   `antennaSettleMs` (20 → 10 → 5 → 2 → 0)、`reqaTimeoutMs` (25 → 15 → 10 → 5)、
-   `reqaAttempts` (2 → 1) 由大往小試。每顆讀卡機各自有自己的候選值與進度，
+3. **掃描階段**：依序對 `rstSettleMs` (起點 → 30 → 20 → 15 → 10)、
+   `antennaSettleMs` (起點 → 10 → 5 → 2 → 0)、`reqaTimeoutMs` (起點 → 15 → 10 → 5)、
+   `reqaAttempts` (起點 → 1) 由起點往小試。每顆讀卡機各自有自己的候選值與進度，
    但一輪掃描本來就會輪過七顆，所以七顆在同一輪裡各測各的候選值，
    每顆各自搜尋不需要七倍時間。每個候選值跑 N 輪，全中才往下一個更小的值走；
-   取最小可過的值之後，時間類參數再往上加「安全餘裕」階數 (預設 1 階)。
-4. **驗證階段**：用最終值跑 M 輪。任何一顆漏讀就把它的時間類參數各放寬一階、
-   REQA 次數回到最多，然後重驗 (最多 2 次)；仍失敗的讀卡機退回原設定並標記。
+   取最小可過的值之後，時間類參數再往上加「安全餘裕」階數 (預設 1 階，不超過起點)。
+4. **驗證階段**：用最終值跑 M 輪。任何一顆漏讀就把它的四個參數各放寬一階，
+   然後重驗 (最多 2 次)；仍失敗的讀卡機退回原設定並標記。
 5. **輸出**：SPI 時脈、每顆的覆寫值、每顆的驗證命中率、估計一輪時間 (前後對照) 與說明。
-   「套用並儲存」會把 SPI 時脈與 `readers` 覆寫寫入設定檔，全域值不動。
+   「套用並儲存」會把 SPI 時脈與 `readers` 覆寫寫入設定檔，全域值不動；
+   `readers` 裡原有的覆寫都保留 (不穩定的讀卡機、沒掃描的欄位、沒接的讀卡機)，
+   只有穩定讀卡機掃描過的四個參數會被蓋掉。
 
-預設 N = 5、M = 20，整個流程約 30 到 60 秒。輪數與餘裕都可以在對話框裡調。
+量測 (確認、掃描、驗證) 時每顆都額外套上 `linkCheckTimeoutMs: 0`、`readerRetries: 0`，
+太小的候選值才不會被連線檢查的保險等待或重新上電重讀「救回來」而量到假的門檻；
+命中只算「沒有重讀就讀到卡片」的那一輪。最終設定不含這兩個欄位，還原成原本的值。
+
+`interReaderGapMs` 不在搜尋範圍。它只是前一顆 RST 拉低到下一顆 RST 拉高之間的一段
+`Future.delayed`，預設 1 ms、往下只有 0 可選，七顆一輪最多省 7 ms，比單次掃描的時間抖動還小；
+它保護的時間窗跟下一顆的 `rstSettleMs` 是同一段，顆間若真有干擾會表現成下一顆偵測失敗，
+每顆的掃描已經抓得到。要調可以在設定頁或用 `set interReaderGapMs=…` 手動改。
+
+預設 N = 5、M = 20，整個流程約 30 到 60 秒；有讀卡機需要放寬時會多幾十秒。
+輪數與餘裕都可以在對話框裡調。
 「穩定」的判定是統計上的：N 輪全中只能排除很明顯的失敗，
 所以要靠餘裕階數與較多的驗證輪數把邊緣值排除；卡片位置、溫度改變後可以重跑一次。
 
@@ -180,7 +208,8 @@ dart run scripts/rfid_calibrate.dart link
 # 只依連線品質推薦 spiSpeedHz 與 rstSettleMs，--write 寫入設定檔
 dart run scripts/rfid_calibrate.dart recommend --write
 
-# 自動最佳化 (七顆都放卡片)，--write 寫入 SPI 時脈與每顆覆寫
+# 自動最佳化 (七顆都放卡片)，--write 寫入 SPI 時脈與穩定讀卡機的四個參數 (其他覆寫不動)
+# 有讀卡機不穩定時不寫入，確定只寫穩定那幾顆請加 --force
 dart run scripts/rfid_calibrate.dart optimize --write
 dart run scripts/rfid_calibrate.dart optimize --sweep-rounds 10 --verify-rounds 50 --margin 2
 
@@ -192,7 +221,7 @@ dart run scripts/rfid_calibrate.dart sweep --rst 5,10,20,50 --antenna 0,2,5,10 -
 
 # 直接改設定檔：全域值、單顆覆寫、清除覆寫
 dart run scripts/rfid_calibrate.dart set rstSettleMs=20 antennaSettleMs=5
-dart run scripts/rfid_calibrate.dart set 07.rstSettleMs=30 07.antennaSettleMs=10
+dart run scripts/rfid_calibrate.dart set 07.rstSettleMs=30 07.antennaSettleMs=10   # 寫 7. 也可以
 dart run scripts/rfid_calibrate.dart set 07.clear
 dart run scripts/rfid_calibrate.dart set clear
 ```
@@ -209,7 +238,9 @@ dart run scripts/rfid_calibrate.dart set clear
 - 「就緒 ms」是 RST 拉高後 VersionReg 變成可讀的時間，`rstSettleMs` 只要比它大一些就夠。
 - 「錯誤/樣本」是寫入再讀回不一致的次數。不是 0 就代表這個時脈下 SPI 不可靠，線最長的那顆通常最先出錯。
 
-指令都可以加 `--readers 1,2,7` 只測某幾顆、`--file <path>` 指定設定檔、`--verbose` 看細節。
+`link`、`bench`、`sweep`、`optimize` 都可以加 `--readers 1,2,7` 只測某幾顆 (沒選到的 RST 仍會拉低，
+bus 上不會有別顆醒著)；所有指令都可以加 `--file <path>` 指定設定檔、`--verbose` 看細節。
+參數錯誤與執行失敗都以 exit code 1 結束。
 
 ## 7. 長線的硬體建議
 
@@ -246,8 +277,8 @@ dart run scripts/rfid_calibrate.dart set clear
 
 | 欄位 | 預設 | 做什麼 |
 |---|---|---|
-| `writeVerifyRetries` | 2 | 關鍵暫存器 (timer、ASK、Mode、TxControl、ComIEn、Command、BitFraming、FIFO 內容數) 寫入後讀回驗證，不符就重寫，最多 2 次。偶發的位元錯誤因此只多花幾十微秒 |
-| `anticollRetries` | 2 | UID 的 BCC 校驗失敗時 (卡片還在 READY) 直接重送 anticoll，之後才重做 REQA；第二次起改用 WUPA |
+| `writeVerifyRetries` | 2 | 關鍵暫存器 (timer、ASK、Mode、TxControl、ComIEn、Command、BitFraming、FIFO 內容數) 寫入後讀回驗證，不符就重寫，最多 2 次。偶發的位元錯誤因此只多花幾十微秒。設 0 是只寫不驗證 (舊版行為)，Keyestudio 常見的相容晶片若某個暫存器讀回行為跟原廠不同，用這個關掉 |
+| `anticollRetries` | 2 | UID 的 BCC 校驗失敗時 (卡片還在 READY) 直接重送 anticoll；用完之後先把 RF 場關掉 5 ms 再打開讓卡片回到 IDLE，才重做 REQA (READY 狀態的卡片不理 REQA，也從沒送過 HLTA，所以不用 WUPA) |
 | `readerRetries` | 1 | 一顆回報線路異常、晶片無回應或 SPI 寫入錯誤時，RST 重新上電再讀一次 |
 
 三個欄位都可以對單顆覆寫。線路正常時它們幾乎不花時間；線路差時每顆最多多

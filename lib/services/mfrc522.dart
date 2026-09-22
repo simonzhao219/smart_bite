@@ -55,7 +55,8 @@ class MFRC522 {
   /// 每次讀取前可以依當次生效的時序設定重新指定。
   int commDeadlineMs;
 
-  /// 關鍵暫存器寫入後讀回不符時，最多重寫幾次
+  /// 關鍵暫存器寫入後讀回不符時，最多重寫幾次。
+  /// 0 代表只寫不驗證 (舊版行為)，相容晶片讀回行為不同時可以關掉。
   int writeVerifyRetries;
 
   /// 累計的重寫次數 (診斷用)，由呼叫端在每次讀卡前歸零
@@ -63,9 +64,12 @@ class MFRC522 {
 
   MFRC522(
     this.bus, {
-    this.commDeadlineMs = 36,
+    this.commDeadlineMs = 50,
     this.writeVerifyRetries = 2,
   });
+
+  /// 硬體 reset 後 TxControlReg 的值 (0x80) 加上 Tx1RFEn / Tx2RFEn
+  static const int txControlAntennaOn = 0x83;
 
   /// 各暫存器讀回驗證時要比對的位元：保留位元讀回值不保證跟寫入相同，必須排除
   static const Map<int, int> verifyMasks = {
@@ -84,6 +88,8 @@ class MFRC522 {
     MFRC522Registers.tReloadRegL: 0xFF,
   };
 
+  bool get _verifyEnabled => writeVerifyRetries > 0;
+
   int readRegister(int register) => bus.readRegister(register);
 
   void writeRegister(int register, int value) =>
@@ -101,7 +107,12 @@ class MFRC522 {
 
   /// 寫入後讀回驗證，只比對 [mask] 的位元 (不給就用 [verifyMasks])。
   /// 不符就重寫，最多 [writeVerifyRetries] 次；最後仍不符回 false。
+  /// [writeVerifyRetries] 為 0 時只寫不讀回，永遠回 true。
   bool writeRegisterVerified(int register, int value, {int? mask}) {
+    if (!_verifyEnabled) {
+      writeRegister(register, value);
+      return true;
+    }
     final bits = mask ?? verifyMasks[register] ?? 0xFF;
     for (var attempt = 0;; attempt++) {
       writeRegister(register, value);
@@ -165,23 +176,30 @@ class MFRC522 {
     return ok;
   }
 
-  /// 開天線並確認 Tx1RFEn / Tx2RFEn 真的有設上
+  /// 開天線並確認 Tx1RFEn / Tx2RFEn 真的有設上。
+  /// 直接寫 reset 值加上兩個致能位元，不做 read-modify-write，
+  /// 讀回被干擾成 0xFF 之類的值時才不會把錯的位元一起寫進去。
   bool antennaOn() {
-    final current = readRegister(MFRC522Registers.txControlReg);
-    if ((current & 0x03) == 0x03) return true;
     return writeRegisterVerified(
       MFRC522Registers.txControlReg,
-      current | 0x03,
+      txControlAntennaOn,
       mask: 0x03,
     );
   }
 
   void antennaOff() {
-    clearBitMask(MFRC522Registers.txControlReg, 0x03);
+    writeRegister(
+      MFRC522Registers.txControlReg,
+      txControlAntennaOn & ~0x03 & 0xFF,
+    );
   }
 
   /// FlushBuffer 之後 FIFOLevel 應為 0
   bool _flushFifoVerified() {
+    if (!_verifyEnabled) {
+      writeRegister(MFRC522Registers.fifoLevelReg, 0x80);
+      return true;
+    }
     for (var attempt = 0;; attempt++) {
       writeRegister(MFRC522Registers.fifoLevelReg, 0x80);
       if ((readRegister(MFRC522Registers.fifoLevelReg) & 0x7F) == 0) {
@@ -194,6 +212,12 @@ class MFRC522 {
 
   /// 把要送的資料寫進 FIFO，並確認 FIFOLevel 等於送出的 byte 數
   bool _loadFifoVerified(List<int> sendData) {
+    if (!_verifyEnabled) {
+      for (final byte in sendData) {
+        writeRegister(MFRC522Registers.fifoDataReg, byte & 0xFF);
+      }
+      return true;
+    }
     for (var attempt = 0;; attempt++) {
       for (final byte in sendData) {
         writeRegister(MFRC522Registers.fifoDataReg, byte & 0xFF);
@@ -210,16 +234,20 @@ class MFRC522 {
 
   /// 送指令給晶片並等待完成。
   ///
+  /// [bitFraming] 是 BitFramingReg 的值 (REQA 用 0x07 只送 7 個 bit)，
+  /// StartSend 用直接寫入 `bitFraming | 0x80`，不做 read-modify-write。
+  ///
   /// 回傳的 status：
   /// - [MFRC522Status.ok]：有收到卡片回應
   /// - [MFRC522Status.notag]：晶片 timer 逾時，代表晶片正常但場內沒有卡
   /// - [MFRC522Status.timeout]：牆鐘上限內晶片連 timer IRQ 都沒舉起，
   ///   通常是 SPI 線路或供電問題
   /// - [MFRC522Status.spiError]：準備階段的暫存器寫入重寫後仍讀回不符
-  /// - [MFRC522Status.error]：ErrorReg 有 BufferOvfl / CollErr / ParityErr / ProtocolErr
+  /// - [MFRC522Status.error]：ErrIRq 舉起或 ErrorReg 有錯誤位元
   Mfrc522Reply communicate(
     int command,
     List<int> sendData, {
+    int bitFraming = 0x00,
     int? deadlineMs,
   }) {
     var irqEn = 0x00;
@@ -234,6 +262,11 @@ class MFRC522 {
 
     const failed = (
       status: MFRC522Status.spiError,
+      backData: <int>[],
+      backLen: 0,
+    );
+    const errorReply = (
+      status: MFRC522Status.error,
       backData: <int>[],
       backLen: 0,
     );
@@ -252,32 +285,49 @@ class MFRC522 {
       return failed;
     }
     if (!_loadFifoVerified(sendData)) return failed;
+    final framing = bitFraming & 0x7F;
+    if (!writeRegisterVerified(MFRC522Registers.bitFramingReg, framing)) {
+      return failed;
+    }
     if (!writeRegisterVerified(MFRC522Registers.commandReg, command)) {
       return failed;
     }
     if (command == MFRC522Commands.transceive) {
-      // StartSend
-      setBitMask(MFRC522Registers.bitFramingReg, 0x80);
+      // StartSend：直接寫已知值，不讀回 (StartSend 會自清)
+      writeRegister(MFRC522Registers.bitFramingReg, framing | 0x80);
     }
 
+    // 等 IRQ：成功旗標、ErrIRq 或 TimerIRq 任一舉起就離開；
+    // 期限到了之後再讀最後一次，系統卡頓時才不會把已經完成的結果當成無回應。
     final deadline = deadlineMs ?? commDeadlineMs;
     final stopwatch = Stopwatch()..start();
     var completed = false;
+    var errorFired = false;
     var timerFired = false;
-    do {
+    var finalRead = false;
+    while (true) {
       final irq = readRegister(MFRC522Registers.comIrqReg);
       if ((irq & waitIRq) != 0) {
         completed = true;
+        break;
+      }
+      if ((irq & 0x02) != 0) {
+        errorFired = true;
         break;
       }
       if ((irq & 0x01) != 0) {
         timerFired = true;
         break;
       }
-    } while (stopwatch.elapsedMilliseconds < deadline);
+      if (stopwatch.elapsedMilliseconds >= deadline) {
+        if (finalRead) break;
+        finalRead = true;
+      }
+    }
 
-    clearBitMask(MFRC522Registers.bitFramingReg, 0x80);
+    writeRegister(MFRC522Registers.bitFramingReg, framing);
 
+    if (errorFired) return errorReply;
     if (!completed) {
       return (
         status: timerFired ? MFRC522Status.notag : MFRC522Status.timeout,
@@ -288,7 +338,7 @@ class MFRC522 {
 
     // BufferOvfl / CollErr / ParityErr / ProtocolErr
     if ((readRegister(MFRC522Registers.errorReg) & 0x1B) != 0) {
-      return (status: MFRC522Status.error, backData: const <int>[], backLen: 0);
+      return errorReply;
     }
 
     if (command != MFRC522Commands.transceive) {
@@ -311,10 +361,11 @@ class MFRC522 {
   /// REQA / WUPA：找場內的卡片，成功會收到 2 bytes ATQA (16 bits)
   ({int status, List<int> backBits}) request(int reqMode) {
     // 只送 7 個 bit
-    if (!writeRegisterVerified(MFRC522Registers.bitFramingReg, 0x07)) {
-      return (status: MFRC522Status.spiError, backBits: const <int>[]);
-    }
-    final reply = communicate(MFRC522Commands.transceive, [reqMode]);
+    final reply = communicate(
+      MFRC522Commands.transceive,
+      [reqMode],
+      bitFraming: 0x07,
+    );
 
     if (reply.status != MFRC522Status.ok) {
       return (status: reply.status, backBits: const <int>[]);
@@ -327,12 +378,10 @@ class MFRC522 {
 
   /// Anti-collision (cascade level 1)：取得 4 bytes UID 加 1 byte BCC
   ({int status, List<int> uid}) anticoll() {
-    if (!writeRegisterVerified(MFRC522Registers.bitFramingReg, 0x00)) {
-      return (status: MFRC522Status.spiError, uid: const <int>[]);
-    }
     final reply = communicate(
       MFRC522Commands.transceive,
       [PICCCommands.anticoll, 0x20],
+      bitFraming: 0x00,
     );
 
     if (reply.status != MFRC522Status.ok) {

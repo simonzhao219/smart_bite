@@ -87,13 +87,13 @@ class RFIDReaderProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 連線檢測
+  /// 連線檢測。開始時不另外 notify：manager 翻轉 [isCalibrating] 時會通知，
+  /// 而且這裡在任何 await 之前 notify 會撞上對話框 initState 期間的 build。
   Future<List<LinkMeasurement>> probeLinks({
     List<int>? speeds,
     int samples = 200,
     void Function(String message)? onProgress,
   }) async {
-    notifyListeners();
     try {
       return await _readerManager.probeLinks(
         speeds: speeds,
@@ -105,13 +105,12 @@ class RFIDReaderProvider extends ChangeNotifier {
     }
   }
 
-  /// 自動最佳化 (七顆都要放卡片)
+  /// 自動最佳化 (七顆都要放卡片)。開始時不另外 notify，理由同 [probeLinks]。
   Future<OptimizationResult> optimize(
     RfidOptimizerOptions options, {
     void Function(OptimizerProgress progress)? onProgress,
     RfidCancelToken? cancel,
   }) async {
-    notifyListeners();
     try {
       return await _readerManager.optimize(
         options,

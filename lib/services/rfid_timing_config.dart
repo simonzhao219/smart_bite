@@ -110,7 +110,9 @@ class RfidTimingConfig {
   final int reqaAttempts;
 
   /// 軟體端等待 IRQ 的牆鐘上限 (ms)。
-  /// 會自動提升到至少 [reqaTimeoutMs] + 10，否則晶片 timer 還沒響軟體就先放棄。
+  /// 會自動提升到至少 [reqaTimeoutMs] + [commDeadlineMarginMs]：晶片 timer 響了之後，
+  /// 軟體端還要留一段時間讓 isolate 被排程回來讀旗標，kiosk 上同時有繪圖與列印時
+  /// 卡 10 幾 ms 很常見，餘裕太小會把空的讀卡機判成「晶片無回應」。
   final int commDeadlineMs;
 
   /// 一顆讀完、RST 拉低之後，到下一顆開始之前的間隔 (ms)。
@@ -123,6 +125,7 @@ class RfidTimingConfig {
   final int scanTimeoutSec;
 
   /// 關鍵暫存器寫入後讀回不符時最多重寫幾次。長線的偶發位元錯誤靠這個吃掉。
+  /// 0 代表只寫不驗證 (舊版行為)，相容晶片的暫存器讀回行為跟原廠不同時可以關掉。
   final int writeVerifyRetries;
 
   /// anticoll 校驗失敗 (卡片還在 READY) 時最多直接重送幾次，之後才重做 REQA。
@@ -142,7 +145,7 @@ class RfidTimingConfig {
     this.antennaSettleMs = 5,
     this.reqaTimeoutMs = 25,
     this.reqaAttempts = 2,
-    this.commDeadlineMs = 36,
+    this.commDeadlineMs = 50,
     this.interReaderGapMs = 1,
     this.postScanSettleMs = 0,
     this.scanTimeoutSec = 10,
@@ -154,6 +157,10 @@ class RfidTimingConfig {
 
   /// 程式內建預設值
   static const RfidTimingConfig defaults = RfidTimingConfig();
+
+  /// [effectiveCommDeadlineMs] 至少比 [reqaTimeoutMs] 多這麼多 (ms)，
+  /// 留給 isolate 被排程回來讀 IRQ 旗標的時間
+  static const int commDeadlineMarginMs = 25;
 
   /// 所有全域欄位的名稱 (同時也是 JSON key)
   static const List<String> keys = [
@@ -227,18 +234,20 @@ class RfidTimingConfig {
     'antennaSettleMs': '天線開啟後讓卡片上電。ISO 14443 要求 5 ms 內就緒。',
     'reqaTimeoutMs': '沒卡時每次 REQA 要等這麼久才放棄。',
     'reqaAttempts': '每顆 REQA 最多試幾次。',
-    'commDeadlineMs': '軟體端等 IRQ 的上限，會自動 ≥ REQA 逾時 + 10。',
+    'commDeadlineMs': '軟體端等 IRQ 的上限，會自動 ≥ REQA 逾時 + 25。',
     'interReaderGapMs': '兩顆之間的間隔。',
     'postScanSettleMs': '整輪結束後的額外等待。',
     'scanTimeoutSec': '整輪超過這個時間視為硬體卡死。會自動 ≥ 最壞情況 × 2。',
-    'writeVerifyRetries': '寫入後讀回不符就重寫，吃掉長線的偶發位元錯誤。0 = 不驗證重寫。',
+    'writeVerifyRetries': '寫入後讀回不符就重寫，吃掉長線的偶發位元錯誤。0 = 只寫不驗證。',
     'anticollRetries': 'UID 校驗失敗時直接重送 anticoll 的次數，之後才重做 REQA。',
     'readerRetries': '線路異常、無回應或 SPI 錯誤時，重新上電再讀的次數。',
   };
 
-  /// 軟體等待 IRQ 的實際上限
-  int get effectiveCommDeadlineMs =>
-      commDeadlineMs < reqaTimeoutMs + 10 ? reqaTimeoutMs + 10 : commDeadlineMs;
+  /// 軟體等待 IRQ 的實際上限：至少 [reqaTimeoutMs] + [commDeadlineMarginMs]
+  int get effectiveCommDeadlineMs {
+    final floor = reqaTimeoutMs + commDeadlineMarginMs;
+    return commDeadlineMs < floor ? floor : commDeadlineMs;
+  }
 
   /// 是否有任何一顆讀卡機有覆寫值
   bool get hasReaderOverrides =>
@@ -492,8 +501,9 @@ class RfidTimingConfig {
 
   /// 預設設定檔路徑：`$HOME/Documents/rfid_timing.json`
   ///
-  /// Raspberry Pi OS 上 path_provider 的 documents 目錄也是這裡，
-  /// 所以 CLI 校正工具與 Flutter app 會讀到同一個檔案。
+  /// Flutter app 與 CLI 校正工具都用這個函式決定路徑，兩邊只有一個真相。
+  /// (不用 path_provider：Linux 上它回傳 `xdg-user-dir DOCUMENTS`，
+  /// 語系不同時會是 `~/文件` 之類的目錄，app 與 CLI 就會讀寫不同的檔案。)
   static String defaultFilePath({Map<String, String>? environment}) {
     final env = environment ?? Platform.environment;
     final home = env['HOME'] ?? env['USERPROFILE'];
@@ -547,10 +557,16 @@ class RfidTimingConfig {
   }
 
   /// 以縮排 JSON 寫入設定檔，目錄不存在會自動建立。
+  ///
+  /// 先寫到同目錄的暫存檔、flush 到磁碟，再 rename 到目標路徑 (同一個檔案系統下是
+  /// 原子操作)。kiosk 常見硬關機，直接覆寫原檔可能留下截斷的檔案，
+  /// 下次啟動就會靜默退回預設值。
   Future<void> saveTo(String path) async {
     final file = File(path);
     await file.parent.create(recursive: true);
-    await file.writeAsString('${toPrettyJson()}\n');
+    final temp = File('$path.tmp');
+    await temp.writeAsString('${toPrettyJson()}\n', flush: true);
+    await temp.rename(path);
   }
 
   String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());

@@ -92,8 +92,12 @@ class RfidTimingSettingsCard extends StatelessWidget {
             if (load != null)
               Text(
                 load.sourceDescription,
-                style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
-                maxLines: 2,
+                // 設定檔壞掉時 app 會靜默退回預設值，用醒目顏色提醒操作者
+                style: textTheme.bodySmall?.copyWith(
+                  color: load.error != null ? Colors.red : Colors.grey[600],
+                  fontWeight: load.error != null ? FontWeight.w600 : null,
+                ),
+                maxLines: load.error != null ? 4 : 2,
                 overflow: TextOverflow.ellipsis,
               ),
             const SizedBox(height: 12),
@@ -151,6 +155,8 @@ Future<void> showTimingEditDialog(
   if (!context.mounted) return;
   final saved = await showDialog<bool>(
     context: context,
+    // 點對話框外面會靜默丟掉修改，一律要按「取消」或「儲存」
+    barrierDismissible: false,
     builder: (_) => _TimingEditDialog(
       provider: provider,
       initial: load?.config ?? RfidTimingConfig.defaults,
@@ -465,7 +471,12 @@ class _LinkCheckDialogState extends State<_LinkCheckDialog> {
   String _message = '準備中…';
   List<LinkMeasurement>? _measurements;
   CalibrationRecommendation? _recommendation;
+
+  /// 量測本身失敗 (沒有結果可看)
   String? _error;
+
+  /// 套用建議失敗：結果表要留著，操作者可以再按一次
+  String? _applyError;
   bool _applying = false;
 
   bool get _running => _measurements == null && _error == null;
@@ -473,7 +484,10 @@ class _LinkCheckDialogState extends State<_LinkCheckDialog> {
   @override
   void initState() {
     super.initState();
-    _start();
+    // 等第一個 frame 畫完再開始，provider 的通知才不會落在 build 期間
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _start();
+    });
   }
 
   Future<void> _start() async {
@@ -501,7 +515,10 @@ class _LinkCheckDialogState extends State<_LinkCheckDialog> {
   Future<void> _applyRecommendation() async {
     final recommendation = _recommendation;
     if (recommendation == null) return;
-    setState(() => _applying = true);
+    setState(() {
+      _applying = true;
+      _applyError = null;
+    });
     try {
       await widget.provider.saveTiming(recommendation.config);
       if (!mounted) return;
@@ -516,7 +533,7 @@ class _LinkCheckDialogState extends State<_LinkCheckDialog> {
       if (mounted) {
         setState(() {
           _applying = false;
-          _error = '套用失敗: $e';
+          _applyError = '套用失敗: $e';
         });
       }
     }
@@ -554,6 +571,15 @@ class _LinkCheckDialogState extends State<_LinkCheckDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (_applyError != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                _applyError!,
+                style: const TextStyle(
+                    color: Colors.red, fontWeight: FontWeight.w600),
+              ),
+            ),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: DataTable(
@@ -734,7 +760,10 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
   Future<void> _apply() async {
     final result = _result;
     if (result == null) return;
-    setState(() => _applying = true);
+    setState(() {
+      _applying = true;
+      _error = null;
+    });
     try {
       await widget.provider.saveTiming(result.config);
       if (!mounted) return;
@@ -746,11 +775,12 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
         ),
       );
     } catch (e) {
+      // 留在結果畫面：硬體最佳化跑了幾十秒，儲存失敗 (唯讀檔案系統、權限) 不該把結果丟掉，
+      // 錯誤顯示在結果表上方，「套用並儲存」維持可按
       if (mounted) {
         setState(() {
           _applying = false;
           _error = '儲存失敗: $e';
-          _phase = _OptimizePhase.error;
         });
       }
     }
@@ -975,6 +1005,15 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    _error!,
+                    style: const TextStyle(
+                        color: Colors.red, fontWeight: FontWeight.w600),
+                  ),
+                ),
               if (!result.cancelled) ...[
                 Text(
                   'SPI 時脈 ${result.before.spiSpeedHz} → ${result.config.spiSpeedHz} Hz；'

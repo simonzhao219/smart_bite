@@ -16,7 +16,6 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../interfaces/rfid_reader.dart';
 import '../models/rfid_models.dart';
@@ -73,12 +72,22 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
   final Map<String, RFIDReading> _latestReadings = {};
   final Map<String, ReaderScanResult> _latestResults = {};
 
-  /// 時序設定檔路徑；null 表示用 path_provider 的文件目錄
+  /// 時序設定檔路徑；null 表示用 [RfidTimingConfig.defaultFilePath] (跟 CLI 相同)
   final String? _timingFilePath;
+
+  /// 校正 isolate 的整體逾時。isolate 若卡在 FFI 呼叫或結束時沒回傳結果，
+  /// 超過這個時間就放棄並解除 [isCalibrating]，設定頁才不會永遠鎖住。
+  /// 這是安全網不是預算：預設輪數的最佳化含放寬與重驗通常在 2 到 5 分鐘內結束。
+  final Duration calibrationTimeout;
+
   RfidTimingLoadResult? _timingLoad;
   Duration? _lastScanDuration;
   int? _lastCycleMs;
   bool _calibrating = false;
+
+  /// 有一輪掃描正在 background isolate 跑。掃描與校正都要同一組 GPIO / SPI，
+  /// 兩者互斥：掃描中不能開始校正，校正中略過掃描。
+  bool _scanInFlight = false;
 
   /// Default configuration for 7 RC522 modules on Raspberry Pi
   ///
@@ -97,6 +106,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
   GPIOSPIRFIDReaderManager({
     List<RC522Config>? configs,
     String? timingFilePath,
+    this.calibrationTimeout = const Duration(minutes: 10),
   })  : _configs = configs ?? defaultConfigs,
         _timingFilePath = timingFilePath;
 
@@ -188,7 +198,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
   @override
   Future<void> saveTiming(RfidTimingConfig config) async {
-    final path = await _timingPath();
+    final path = _timingPath();
     await config.validated().saveTo(path);
     debugPrint('RFID 時序設定已寫入 $path');
     _timingLoad = null;
@@ -196,26 +206,20 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     notifyListeners();
   }
 
-  Future<String> _timingPath() async {
+  /// 設定檔路徑：環境變數 → 建構時指定 → [RfidTimingConfig.defaultFilePath]。
+  /// 跟 CLI 用同一個函式決定路徑，兩邊才會讀寫同一個檔案 (path_provider 在 Linux 上
+  /// 回傳 `xdg-user-dir DOCUMENTS`，語系不同時會是 `~/文件` 之類的目錄)。
+  String _timingPath() {
     final envPath = Platform.environment[RfidTimingConfig.fileEnvKey];
     if (envPath != null && envPath.isNotEmpty) return envPath;
-    final configured = _timingFilePath;
-    if (configured != null) return configured;
-    try {
-      final directory = await getApplicationDocumentsDirectory();
-      return '${directory.path}${Platform.pathSeparator}'
-          '${RfidTimingConfig.defaultFileName}';
-    } catch (e) {
-      debugPrint('⚠ 無法取得文件目錄，改用預設路徑: $e');
-      return RfidTimingConfig.defaultFilePath();
-    }
+    return _timingFilePath ?? RfidTimingConfig.defaultFilePath();
   }
 
   Future<RfidTimingLoadResult> _ensureTiming() async {
     final cached = _timingLoad;
     if (cached != null) return cached;
 
-    final load = await RfidTimingConfig.load(filePath: await _timingPath());
+    final load = await RfidTimingConfig.load(filePath: _timingPath());
     _timingLoad = load;
     debugPrint('RFID 時序設定: ${load.sourceDescription}');
     debugPrint('RFID 時序設定值: ${load.config.toJson()}');
@@ -228,8 +232,8 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
   @override
   Future<List<RFIDReading>> scanAll() async {
-    if (_calibrating) {
-      debugPrint('校正進行中，略過這次掃描');
+    if (_calibrating || _scanInFlight) {
+      debugPrint(_calibrating ? '校正進行中，略過這次掃描' : '上一輪掃描還在跑，略過這次掃描');
       return _configs
           .map((config) =>
               _latestReadings[config.deviceId] ??
@@ -239,6 +243,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
     debugPrint('Starting async scan of ${_configs.length} readers...');
     final stopwatch = Stopwatch()..start();
+    _scanInFlight = true;
 
     try {
       final load = await _ensureTiming();
@@ -290,6 +295,8 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
       notifyListeners();
       return errorReadings;
+    } finally {
+      _scanInFlight = false;
     }
   }
 
@@ -412,6 +419,11 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
 
   /// 在獨立 isolate 跑一個校正工作。
   /// isolate 先送回它的 control SendPort (用來取消)，之後送 progress / result / error。
+  ///
+  /// isolate 沒送 result / error 就結束 (onExit)、或超過 [calibrationTimeout]
+  /// 還沒結束，都會以錯誤結束並解除 [isCalibrating]，否則設定頁會永遠鎖在校正中。
+  /// 注意 [Isolate.kill] 中斷不了正在執行的 FFI 呼叫，卡住的 isolate 要等那個呼叫
+  /// 回來才會真的結束，這段時間 GPIO 可能仍是 busy。
   Future<Map<String, dynamic>> _runCalibrationJob(
     Map<String, dynamic> message, {
     void Function(Map<String, dynamic> progress)? onProgress,
@@ -420,11 +432,15 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     if (_calibrating) {
       throw StateError('連線檢測或最佳化已在進行中');
     }
+    if (_scanInFlight) {
+      throw StateError('掃描進行中，請等這一輪掃描結束再開始');
+    }
     _calibrating = true;
     notifyListeners();
 
     final receivePort = ReceivePort();
     final errorPort = ReceivePort();
+    final exitPort = ReceivePort();
     final completer = Completer<Map<String, dynamic>>();
     SendPort? controlPort;
 
@@ -457,6 +473,11 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
         completer.completeError(StateError('校正 isolate 發生錯誤: $data'));
       }
     });
+    final exitSubscription = exitPort.listen((_) {
+      if (!completer.isCompleted) {
+        completer.completeError(StateError('校正 isolate 結束了，但沒有回傳結果'));
+      }
+    });
 
     Isolate? isolate;
     try {
@@ -464,15 +485,24 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
         _calibrationIsolateEntry,
         <String, dynamic>{...message, 'sendPort': receivePort.sendPort},
         onError: errorPort.sendPort,
+        onExit: exitPort.sendPort,
         debugName: 'rfid-calibration',
       );
-      return await completer.future;
+      return await completer.future.timeout(
+        calibrationTimeout,
+        onTimeout: () => throw TimeoutException(
+          '校正超過 ${calibrationTimeout.inMinutes} 分鐘沒有結束，已中止',
+          calibrationTimeout,
+        ),
+      );
     } finally {
       cancel?.removeListener(sendCancel);
       await subscription.cancel();
       await errorSubscription.cancel();
+      await exitSubscription.cancel();
       receivePort.close();
       errorPort.close();
+      exitPort.close();
       isolate?.kill(priority: Isolate.immediate);
       _calibrating = false;
       notifyListeners();

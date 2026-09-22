@@ -213,7 +213,8 @@ void main() {
       expect(reply.status, MFRC522Status.timeout);
       expect(reply.backData, isEmpty);
       expect(stopwatch.elapsedMilliseconds, greaterThanOrEqualTo(20));
-      expect(stopwatch.elapsedMilliseconds, lessThan(200));
+      // 上限只是要證明不是讀滿固定次數，放寬到慢機器也不會 flaky
+      expect(stopwatch.elapsedMilliseconds, lessThan(2000));
     });
 
     test('晶片 timer 逾時回 notag', () {

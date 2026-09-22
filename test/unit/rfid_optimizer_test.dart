@@ -104,11 +104,12 @@ class FakeRunner implements RfidOptimizerRunner {
   }
 }
 
-/// 測試用的小輪數，邏輯跟預設值一樣
+/// 測試用的小輪數，邏輯跟預設值一樣；為了驗證四個參數的搜尋，連 reqaAttempts 也掃
 const testOptions = RfidOptimizerOptions(
   sweepRounds: 3,
   verifyRounds: 8,
   linkSamples: 10,
+  sweepReqaAttempts: true,
 );
 
 void main() {
@@ -394,6 +395,55 @@ void main() {
       expect(result.readers['02']!.verifyHits, testOptions.verifyRounds);
     });
 
+    test('預設不掃 reqaAttempts：維持起點值，也不參與放寬', () async {
+      final runner = FakeRunner({
+        '01': const FakeReaderModel(minRst: 10),
+        '03': const FakeReaderModel(minRst: 150),
+      });
+      final options = testOptions.copyWith(sweepReqaAttempts: false);
+      expect(options.activeParameters,
+          ['rstSettleMs', 'antennaSettleMs', 'reqaTimeoutMs']);
+      final result = await RfidOptimizer(runner, options: options)
+          .run(base: RfidTimingConfig.defaults);
+
+      expect(result.allStable, isTrue);
+      // 兩顆的 REQA 次數都停在預設 3，連放寬過的 03 也一樣
+      expect(result.config.forReader('01').reqaAttempts, 3);
+      expect(result.config.forReader('03').reqaAttempts, 3);
+      expect(result.config.forReader('01').rstSettleMs, 15);
+      expect(result.config.forReader('03').rstSettleMs, 200);
+      expect(result.readers['03']!.values['reqaAttempts'], 3);
+      for (final timing in runner.scanned) {
+        expect(timing.forReader('01').reqaAttempts, 3);
+      }
+    });
+
+    test('候選階梯是升階值與一般候選值的聯集：起點 200 會經過 100、50 再到 20', () async {
+      // 預設天線 200 ms；讀卡機需要 60 ms → 100 可過、50 不行 (不加餘裕 → 100)
+      final runner = FakeRunner({'01': const FakeReaderModel(minAntenna: 60)});
+      final result = await RfidOptimizer(
+        runner,
+        options: testOptions.copyWith(marginSteps: 0),
+      ).run(base: RfidTimingConfig.defaults);
+      expect(result.config.forReader('01').antennaSettleMs, 100);
+      final tried =
+          runner.scanned.map((t) => t.forReader('01').antennaSettleMs).toSet();
+      expect(tried, containsAll([200, 100, 50]));
+    });
+
+    test('取消時每顆都不算穩定', () async {
+      final runner = FakeRunner({'01': const FakeReaderModel()});
+      final result = await RfidOptimizer(
+        runner,
+        options: testOptions,
+        shouldCancel: () => runner.scans >= 2,
+      ).run(base: RfidTimingConfig.defaults);
+      expect(result.cancelled, isTrue);
+      expect(result.allStable, isFalse);
+      expect(result.readers['01']!.stable, isFalse);
+      expect(result.readers['01']!.note, '已取消');
+    });
+
     test('skipLinkStage 時不做連線檢測，時脈維持原設定', () async {
       final runner = FakeRunner({'01': const FakeReaderModel()});
       final result = await RfidOptimizer(
@@ -487,12 +537,29 @@ void main() {
       expect(restored.rstCandidates, options.rstCandidates);
       expect(restored.rstEscalation, options.rstEscalation);
       expect(restored.reqaAttemptEscalation, options.reqaAttemptEscalation);
+      expect(restored.sweepReqaAttempts, isFalse);
+      expect(
+        RfidOptimizerOptions.fromJson(
+          testOptions.toJson(),
+        ).sweepReqaAttempts,
+        isTrue,
+      );
     });
 
-    test('maxSweepRounds 是每個參數一般階數的總和乘輪數 (不含升階)', () {
+    test('預設輪數：8 / 60 / 3，reqaAttempts 不掃', () {
+      const d = RfidOptimizerOptions.defaults;
+      expect(d.sweepRounds, 8);
+      expect(d.verifyRounds, 60);
+      expect(d.maxVerifyRetries, 3);
+      expect(d.sweepReqaAttempts, isFalse);
+    });
+
+    test('maxSweepRounds 是參與搜尋參數一般階數的總和乘輪數 (不含升階)', () {
       const options = RfidOptimizerOptions.defaults;
-      // (5-1) + (5-1) + (4-1) + (2-1) = 12 階 × 5 輪
-      expect(options.maxSweepRounds, 60);
+      // 預設不掃 reqaAttempts：(5-1) + (5-1) + (4-1) = 11 階 × 8 輪
+      expect(options.maxSweepRounds, 88);
+      // 四個都掃：12 階 × 8 輪
+      expect(options.copyWith(sweepReqaAttempts: true).maxSweepRounds, 96);
     });
   });
 

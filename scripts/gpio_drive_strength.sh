@@ -4,13 +4,14 @@
 #
 # 七顆 RC522 共用 SPI bus，長線加七顆負載會讓 SCK / MOSI 的邊緣變慢。
 # Pi 的 GPIO 預設每腳 8 mA，這個腳本把 GPIO 0 到 27 這一組 pad 調高，
-# 讓邊緣變快。SPI0 的 MISO(9)、MOSI(10)、SCK(11) 與所有 RST 腳都在這一組。
+# 讓邊緣變快。SPI0 的 MOSI(10)、SCK(11) 與所有 RST 腳都在這一組；
+# MISO(9) 是 RC522 在驅動，Pi 的 pad 強度管不到它。
 #
 # 用法:
-#   sudo ./scripts/gpio_drive_strength.sh            # 設成 12 mA (建議先試這個)
+#   sudo ./scripts/gpio_drive_strength.sh            # 只顯示目前的值 (預設動作)
+#   sudo ./scripts/gpio_drive_strength.sh 12         # 設成 12 mA (建議先試這個)
 #   sudo ./scripts/gpio_drive_strength.sh 16         # 設成 16 mA (最大)
 #   sudo ./scripts/gpio_drive_strength.sh 8          # 還原預設
-#   sudo ./scripts/gpio_drive_strength.sh show       # 只顯示目前的值
 #
 # 需要 pigpio (sudo apt install pigpio)。腳本會暫時啟動 pigpiod 來寫 pad 暫存器，
 # 寫完就關掉，不會跟 app 使用的 gpiochip / spidev 衝突。設定在重開機前都有效；
@@ -24,7 +25,7 @@ set -euo pipefail
 
 PAD=0            # pad 0 = GPIO 0-27
 DEFAULT_MA=8
-TARGET="${1:-12}"
+TARGET="${1:-show}"
 
 if [ "$EUID" -ne 0 ]; then
     echo "❌ 請用 sudo 執行: sudo $0 [mA|show]"

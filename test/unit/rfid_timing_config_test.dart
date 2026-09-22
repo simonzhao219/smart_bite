@@ -11,16 +11,19 @@ void main() {
       expect(config.spiSpeedHz, 1000000);
       expect(config.rstSettleMs, 50);
       expect(config.linkCheckTimeoutMs, 50);
-      expect(config.antennaSettleMs, 5);
+      // 天線、顆間間隔與 REQA 次數刻意保守 (長線第一次開機就要能用)，靠最佳化往下縮
+      expect(config.antennaSettleMs, 200);
       expect(config.reqaTimeoutMs, 25);
-      expect(config.reqaAttempts, 2);
+      expect(config.reqaAttempts, 3);
       expect(config.commDeadlineMs, 50);
-      expect(config.interReaderGapMs, 1);
+      expect(config.interReaderGapMs, 200);
       expect(config.postScanSettleMs, 0);
       expect(config.scanTimeoutSec, 10);
       expect(config.writeVerifyRetries, 2);
       expect(config.anticollRetries, 2);
       expect(config.readerRetries, 1);
+      expect(config.pollGapMs, 300);
+      expect(config.stickyRounds, 3);
     });
 
     test('keys、ranges、labels 三者一致', () {
@@ -41,9 +44,15 @@ void main() {
 
     test('整輪逾時至少是最壞情況的兩倍', () {
       const config = RfidTimingConfig.defaults;
-      // 最壞情況每顆: (50 + 50 + 5 + 50×2 + 4) × (1 + 1 次重讀) + 1 = 419 ms
-      expect(config.estimateWorstCaseScanMs(1), 419);
-      expect(config.scanTimeoutFor(7), const Duration(seconds: 10));
+      // 最壞情況每顆: (50 + 50 + 200 + 50×3 + 4) × (1 + 1 次重讀) + 200 = 1108 ms，
+      // 一顆時最後沒有顆間間隔，再扣 200
+      expect(config.estimateWorstCaseScanMs(1), 908);
+      // 七顆最壞情況 1108×7-200 = 7556 ms，兩倍超過設定的 10 秒，逾時自動拉長
+      expect(config.scanTimeoutFor(7).inMilliseconds, 7556 * 2);
+      expect(
+          config.scanTimeoutFor(7), greaterThan(const Duration(seconds: 10)));
+      const few = RfidTimingConfig(antennaSettleMs: 5, interReaderGapMs: 1);
+      expect(few.scanTimeoutFor(7), const Duration(seconds: 10));
 
       const slow = RfidTimingConfig(
         rstSettleMs: 1000,
@@ -62,10 +71,10 @@ void main() {
       const config = RfidTimingConfig.defaults;
       final one = config.estimateNoCardScanMs(1);
       final seven = config.estimateNoCardScanMs(7);
-      expect(seven, one * 7);
-      // 50 + 5 + 25×2 + 1 + 4 = 110 ms/顆
-      expect(one, 110);
-      expect(seven, lessThan(1000));
+      // 每顆 50 + 200 + 25×3 + 200 + 4 = 529 ms，最後一顆之後沒有間隔
+      expect(one, 529 - 200);
+      expect(seven, 529 * 7 - 200);
+      expect(seven, lessThan(4000));
     });
   });
 
@@ -144,6 +153,21 @@ void main() {
       expect(RfidTimingConfig.envKeyFor('spiSpeedHz'), 'RFID_SPI_SPEED_HZ');
       expect(RfidTimingConfig.envKeyFor('rstSettleMs'), 'RFID_RST_SETTLE_MS');
       expect(RfidTimingConfig.envKeyFor('reqaAttempts'), 'RFID_REQA_ATTEMPTS');
+    });
+
+    test('環境變數不是整數時記在 invalid 並顯示在來源說明', () async {
+      final result = await RfidTimingConfig.load(
+        filePath: '/nonexistent/rfid_timing.json',
+        environment: const {
+          'RFID_RST_SETTLE_MS': 'abc',
+          'RFID_ANTENNA_SETTLE_MS': '7',
+        },
+      );
+      expect(result.envInvalid, ['RFID_RST_SETTLE_MS']);
+      expect(result.envOverrides, ['antennaSettleMs']);
+      expect(result.config.rstSettleMs, RfidTimingConfig.defaults.rstSettleMs);
+      expect(result.sourceDescription, contains('RFID_RST_SETTLE_MS'));
+      expect(result.sourceDescription, contains('已忽略'));
     });
 
     test('applyEnvironment 只覆寫有給且是整數的欄位', () {
@@ -288,8 +312,10 @@ void main() {
       final r07 = config.forReader('07');
       expect(r07.rstSettleMs, 30);
       expect(r07.antennaSettleMs, 10);
-      expect(r07.reqaAttempts, 2);
+      expect(r07.reqaAttempts, 3);
       expect(r07.readerOverrides, isEmpty);
+      // id 會正規化：7 也對得到 07
+      expect(config.forReader('7'), r07);
 
       final r01 = config.forReader('01');
       expect(r01.rstSettleMs, 20);
@@ -319,6 +345,28 @@ void main() {
         '07': {'rstSettleMs': 25},
       });
       expect(parsed, RfidTimingConfig.fromJson(parsed.toJson()));
+    });
+
+    test('讀卡機 id 正規化：JSON、withReaderOverrides、clear 都把 7 當成 07', () {
+      final fromJson = RfidTimingConfig.fromJson({
+        'readers': {
+          '7': {'rstSettleMs': 33},
+          '02': {'antennaSettleMs': 9},
+        },
+      });
+      expect(fromJson.readerOverrides.keys, containsAll(['07', '02']));
+      expect(fromJson.forReader('07').rstSettleMs, 33);
+
+      final set = RfidTimingConfig.defaults.withReaderOverride(
+        '7',
+        'rstSettleMs',
+        44,
+      );
+      expect(set.readerOverrides['07'], {'rstSettleMs': 44});
+      expect(set.clearReaderOverrides('7').hasReaderOverrides, isFalse);
+      expect(RfidTimingConfig.normalizeDeviceId(' 7 '), '07');
+      expect(RfidTimingConfig.normalizeDeviceId('12'), '12');
+      expect(RfidTimingConfig.normalizeDeviceId('abc'), 'abc');
     });
 
     test('withReaderOverride / withReaderOverrides / clearReaderOverrides', () {
@@ -368,19 +416,20 @@ void main() {
       expect(described['讀卡機 07 覆寫'], contains('rstSettleMs=30'));
 
       final ids = ['01', '07'];
-      // 01: 20+5+25×2+1+4 = 80；07: 30+10+50+1+4 = 95
-      expect(config.estimateNoCardScanMsFor(ids), 175);
-      // 有卡: 01: 20+5+1+4+2 = 32；07: 30+10+1+4+2 = 47
-      expect(config.estimateAllCardsScanMsFor(ids), 79);
-      // 最壞情況取較大的覆寫值 (rst 30、天線 10、次數 3)
+      // 01: 20+5+25×3+200+4 = 304；07: 30+10+75+200+4 = 319；最後一顆之後沒有間隔 -200
+      expect(config.estimateNoCardScanMsFor(ids), 423);
+      // 有卡: 01: 20+5+200+4+2 = 231；07: 30+10+200+4+2 = 246；-200
+      expect(config.estimateAllCardsScanMsFor(ids), 277);
+      // 最壞情況取較大的覆寫值 (rst 30、天線 10、次數 3)；最後一顆之後沒有顆間間隔
       expect(
         config.estimateWorstCaseScanMs(2),
         RfidTimingConfig.worstCaseReaderMs(const RfidTimingConfig(
-              rstSettleMs: 30,
-              antennaSettleMs: 10,
-              reqaAttempts: 3,
-            )) *
-            2,
+                  rstSettleMs: 30,
+                  antennaSettleMs: 10,
+                  reqaAttempts: 3,
+                )) *
+                2 -
+            config.interReaderGapMs,
       );
     });
 

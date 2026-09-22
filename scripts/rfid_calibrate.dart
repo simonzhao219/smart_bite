@@ -8,7 +8,7 @@
 ///   dart run scripts/rfid_calibrate.dart bench [--rounds 10] [--verbose]
 ///   dart run scripts/rfid_calibrate.dart sweep [--rst 5,10,20,50] [--antenna 0,2,5,10] [--rounds 5]
 ///   dart run scripts/rfid_calibrate.dart recommend [--write] [--speeds ...] [--samples N]
-///   dart run scripts/rfid_calibrate.dart optimize [--write [--force]] [--sweep-rounds 5] [--verify-rounds 20] [--margin 1] [--skip-link]
+///   dart run scripts/rfid_calibrate.dart optimize [--write [--force]] [--sweep-rounds 8] [--verify-rounds 60] [--margin 1] [--skip-link] [--sweep-attempts]
 ///   dart run scripts/rfid_calibrate.dart set key=value [01.key=value ...] [01.clear] [clear]
 ///
 /// 共同選項：
@@ -233,6 +233,7 @@ Future<void> _optimize(_Options options) async {
     verifyRounds: options.verifyRounds,
     marginSteps: options.margin,
     skipLinkStage: options.skipLink,
+    sweepReqaAttempts: options.sweepAttempts,
   );
   final runner = HardwareOptimizerRunner(
     configs: configs,
@@ -584,6 +585,7 @@ class _Options {
   int? verifyRounds;
   int? margin;
   bool skipLink = false;
+  bool sweepAttempts = false;
   final List<String> assignments = [];
 
   static const _flags = {
@@ -595,6 +597,7 @@ class _Options {
     'w',
     'force',
     'skip-link',
+    'sweep-attempts',
   };
 
   static _Options parse(List<String> args) {
@@ -660,6 +663,8 @@ class _Options {
         margin = _nonNegative(name, _require(name, value));
       case 'skip-link':
         skipLink = true;
+      case 'sweep-attempts':
+        sweepAttempts = true;
       default:
         throw ArgumentError('未知的選項: --$name');
     }
@@ -724,7 +729,8 @@ RC522 輪巡校正工具 (請先關閉 Smart Bite app 再執行)
                            最小可靠值，讀不到時先往上放寬 (七顆都要放卡片)
                            加 --write 只寫入 SPI 時脈與穩定讀卡機的四個參數，其他覆寫不動；
                            有讀卡機不穩定時需要 --force 才寫
-                           選項: --sweep-rounds 5  --verify-rounds 20  --margin 1  --skip-link
+                           選項: --sweep-rounds 8  --verify-rounds 60  --margin 1  --skip-link
+                                 --sweep-attempts (也掃 reqaAttempts，預設不掃)
   set key=value ...        直接修改設定檔，例如 set rstSettleMs=20 antennaSettleMs=5
                            單顆覆寫: set 07.rstSettleMs=30 07.antennaSettleMs=10 (7. 也可以)
                            清除覆寫: set 07.clear 或 set clear

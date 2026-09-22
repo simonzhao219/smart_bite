@@ -69,7 +69,7 @@ class SettingPage extends StatelessWidget {
         _buildPlatformInfo(context),
         const SizedBox(height: 16),
 
-        // 輪巡時序設定 (可收合)
+        // 輪巡時序設定 (預設收合，展開才佔空間)
         _buildTimingInfo(context, rfidProvider),
         const SizedBox(height: 16),
 
@@ -203,7 +203,8 @@ class SettingPage extends StatelessWidget {
                         address: reader.address,
                         rfidId: rfidId,
                         dishName: dishName,
-                        detail: reading?.errorMessage ?? reading?.rawData,
+                        // 只顯示錯誤訊息；工程師用的摘要在時序卡片的「詳細診斷」
+                        detail: reading?.errorMessage,
                       ),
                     );
                   }).toList(),
@@ -581,7 +582,7 @@ class _ReaderStatusRow extends StatelessWidget {
   final String rfidId;
   final String? dishName;
 
-  /// 錯誤訊息或診斷摘要 (版本、耗時)，顯示在卡片資訊區
+  /// 錯誤訊息，顯示在卡片資訊區
   final String? detail;
 
   const _ReaderStatusRow({

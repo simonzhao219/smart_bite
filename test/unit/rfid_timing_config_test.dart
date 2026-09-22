@@ -18,6 +18,9 @@ void main() {
       expect(config.interReaderGapMs, 1);
       expect(config.postScanSettleMs, 0);
       expect(config.scanTimeoutSec, 10);
+      expect(config.writeVerifyRetries, 2);
+      expect(config.anticollRetries, 2);
+      expect(config.readerRetries, 1);
     });
 
     test('keys、ranges、labels 三者一致', () {
@@ -35,8 +38,8 @@ void main() {
 
     test('整輪逾時至少是最壞情況的兩倍', () {
       const config = RfidTimingConfig.defaults;
-      // 最壞情況每顆: 50 + 50 + 5 + 36×2 + 1 + 4 = 182 ms
-      expect(config.estimateWorstCaseScanMs(1), 182);
+      // 最壞情況每顆: (50 + 50 + 5 + 36×2 + 4) × (1 + 1 次重讀) + 1 = 363 ms
+      expect(config.estimateWorstCaseScanMs(1), 363);
       expect(config.scanTimeoutFor(7), const Duration(seconds: 10));
 
       const slow = RfidTimingConfig(

@@ -103,6 +103,9 @@ class MFRC522Status {
   /// 通常是 SPI 線路或供電問題，而不是「沒有卡」
   static const int timeout = 4;
 
+  /// 關鍵暫存器寫入重寫之後仍讀回不符：SPI 線路錯誤率太高
+  static const int spiError = 5;
+
   static String describe(int status) {
     switch (status) {
       case ok:
@@ -115,6 +118,8 @@ class MFRC522Status {
         return 'collision';
       case timeout:
         return 'comm_timeout';
+      case spiError:
+        return 'spi_error';
       default:
         return 'unknown($status)';
     }

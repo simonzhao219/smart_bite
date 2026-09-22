@@ -7,9 +7,13 @@
 /// 每顆的流程：
 /// 1. RST 拉高 → 等 [RfidTimingConfig.rstSettleMs] 讓振盪器啟動
 /// 2. 讀 VersionReg 確認 SPI 線路真的接到晶片 (線路異常會直接回報，不再假裝「沒有卡」)
-/// 3. 設定暫存器、開天線 → 等 [RfidTimingConfig.antennaSettleMs] 讓卡片上電
-/// 4. REQA (最多 [RfidTimingConfig.reqaAttempts] 次) → anticoll 取 UID
+/// 3. 設定暫存器 (寫入後讀回驗證)、開天線 → 等 [RfidTimingConfig.antennaSettleMs] 讓卡片上電
+/// 4. REQA (最多 [RfidTimingConfig.reqaAttempts] 次，第二次起改用 WUPA) → anticoll 取 UID，
+///    anticoll 校驗失敗會先重送 [RfidTimingConfig.anticollRetries] 次
 /// 5. 關天線、RST 拉低 (立即進 power-down，不需要等待)
+///
+/// 線路異常、晶片無回應或 SPI 寫入錯誤時，會把這顆 RST 重新上電再讀
+/// [RfidTimingConfig.readerRetries] 次，偶發的干擾不會讓整輪少掉一顆。
 library;
 
 import 'dart:async';
@@ -75,6 +79,9 @@ enum ReaderScanStatus {
   /// 晶片一開始有回應，但送指令後在期限內沒有任何 IRQ
   commTimeout('晶片無回應'),
 
+  /// 暫存器寫入重寫之後仍讀回不符：SPI 線路錯誤率太高
+  spiError('SPI 寫入錯誤'),
+
   /// 其他例外 (GPIO 打不開、SPI 失敗…)
   error('錯誤');
 
@@ -105,8 +112,14 @@ class ReaderScanResult {
   /// 這顆總共花的時間 (ms)
   final int elapsedMs;
 
-  /// 實際送出的 REQA 次數
+  /// 最後一次上電裡實際送出的 REQA / WUPA 次數
   final int attempts;
+
+  /// 暫存器寫入讀回不符而重寫的次數 (線路品質指標，正常應為 0)
+  final int spiRetries;
+
+  /// 因線路異常、無回應或 SPI 錯誤而重新上電再讀的次數
+  final int rereads;
 
   /// 錯誤或補充說明
   final String? error;
@@ -119,6 +132,8 @@ class ReaderScanResult {
     this.timeToReadyMs,
     this.elapsedMs = 0,
     this.attempts = 0,
+    this.spiRetries = 0,
+    this.rereads = 0,
     this.error,
   });
 
@@ -142,9 +157,30 @@ class ReaderScanResult {
         : 'v=0x${version!.toRadixString(16).padLeft(2, '0').toUpperCase()}');
     if (timeToReadyMs != null) buffer.write(', ready ${timeToReadyMs}ms');
     if (attempts > 0) buffer.write(', reqa×$attempts');
+    if (spiRetries > 0) buffer.write(', 重寫×$spiRetries');
+    if (rereads > 0) buffer.write(', 重讀×$rereads');
     buffer.write(', ${elapsedMs}ms]');
     if (error != null) buffer.write(' $error');
     return buffer.toString();
+  }
+
+  ReaderScanResult copyWith({
+    int? elapsedMs,
+    int? spiRetries,
+    int? rereads,
+  }) {
+    return ReaderScanResult(
+      deviceId: deviceId,
+      status: status,
+      tagId: tagId,
+      version: version,
+      timeToReadyMs: timeToReadyMs,
+      elapsedMs: elapsedMs ?? this.elapsedMs,
+      attempts: attempts,
+      spiRetries: spiRetries ?? this.spiRetries,
+      rereads: rereads ?? this.rereads,
+      error: error,
+    );
   }
 
   Map<String, dynamic> toJson() => {
@@ -155,6 +191,8 @@ class ReaderScanResult {
         'timeToReadyMs': timeToReadyMs,
         'elapsedMs': elapsedMs,
         'attempts': attempts,
+        'spiRetries': spiRetries,
+        'rereads': rereads,
         'error': error,
       };
 
@@ -167,6 +205,8 @@ class ReaderScanResult {
         timeToReadyMs: (json['timeToReadyMs'] as num?)?.toInt(),
         elapsedMs: (json['elapsedMs'] as num?)?.toInt() ?? 0,
         attempts: (json['attempts'] as num?)?.toInt() ?? 0,
+        spiRetries: (json['spiRetries'] as num?)?.toInt() ?? 0,
+        rereads: (json['rereads'] as num?)?.toInt() ?? 0,
         error: json['error'] as String?,
       );
 
@@ -236,6 +276,9 @@ class LinkProbeResult {
 
 /// 單顆 RC522 (RST 選擇式)
 class SimpleMFRC522 {
+  /// 重新上電再讀之前，RST 保持拉低的時間 (ms)
+  static const int retryPowerDownMs = 2;
+
   final int deviceNum;
   final ResetLine resetLine;
   final MFRC522 chip;
@@ -251,6 +294,8 @@ class SimpleMFRC522 {
           transport,
           commDeadlineMs:
               (timing ?? RfidTimingConfig.defaults).effectiveCommDeadlineMs,
+          writeVerifyRetries:
+              (timing ?? RfidTimingConfig.defaults).writeVerifyRetries,
         );
 
   String get deviceId => deviceNum.toString().padLeft(2, '0');
@@ -261,11 +306,37 @@ class SimpleMFRC522 {
   /// 讀一次卡片。不論結果如何，離開時天線關閉、RST 拉低。
   ///
   /// [timing] 可以指定這一次要用的時序 (例如最佳化時每輪不同)，
-  /// 不給就用建構時的設定。
+  /// 不給就用建構時的設定。線路異常、無回應或 SPI 錯誤時會重新上電再讀
+  /// [RfidTimingConfig.readerRetries] 次。
   Future<ReaderScanResult> scanOnce({RfidTimingConfig? timing}) async {
-    final stopwatch = Stopwatch()..start();
     final t = timing ?? this.timing;
     chip.commDeadlineMs = t.effectiveCommDeadlineMs;
+    chip.writeVerifyRetries = t.writeVerifyRetries;
+    chip.verifyRetries = 0;
+
+    final stopwatch = Stopwatch()..start();
+    var rereads = 0;
+    var result = await _attempt(t, stopwatch);
+    while (!result.linkOk &&
+        result.status != ReaderScanStatus.error &&
+        rereads < t.readerRetries) {
+      rereads++;
+      await _sleep(retryPowerDownMs);
+      result = await _attempt(t, stopwatch);
+    }
+    return result.copyWith(
+      elapsedMs: stopwatch.elapsedMilliseconds,
+      spiRetries: chip.verifyRetries,
+      rereads: rereads,
+    );
+  }
+
+  /// 一次完整的上電、讀卡、關閉
+  Future<ReaderScanResult> _attempt(
+    RfidTimingConfig t,
+    Stopwatch stopwatch,
+  ) async {
+    final startMs = stopwatch.elapsedMilliseconds;
     int? version;
     int? readyMs;
     var attempts = 0;
@@ -275,7 +346,7 @@ class SimpleMFRC522 {
       await _sleep(t.rstSettleMs);
 
       // 連線檢查：VersionReg 讀不到合理值就是線路問題，不用再往下做
-      final linkDeadline = t.rstSettleMs + t.linkCheckTimeoutMs;
+      final linkDeadline = startMs + t.rstSettleMs + t.linkCheckTimeoutMs;
       version = chip.readVersion();
       while (!MFRC522Version.isPlausible(version!) &&
           stopwatch.elapsedMilliseconds < linkDeadline) {
@@ -292,40 +363,71 @@ class SimpleMFRC522 {
           error: 'VersionReg=${MFRC522Version.describe(version)}',
         );
       }
-      readyMs = stopwatch.elapsedMilliseconds;
+      readyMs = stopwatch.elapsedMilliseconds - startMs;
 
-      chip.configure(reqaTimeoutMs: t.reqaTimeoutMs);
+      if (!chip.configure(reqaTimeoutMs: t.reqaTimeoutMs)) {
+        return ReaderScanResult(
+          deviceId: deviceId,
+          status: ReaderScanStatus.spiError,
+          version: version,
+          timeToReadyMs: readyMs,
+          elapsedMs: stopwatch.elapsedMilliseconds,
+          error: '暫存器設定讀回不符',
+        );
+      }
       await _sleep(t.antennaSettleMs);
 
       var lastStatus = MFRC522Status.notag;
       while (attempts < t.reqaAttempts) {
         attempts++;
-        final request = chip.request(PICCCommands.reqidl);
+        // 第一次用 REQA；之後改用 WUPA，卡片若已進 HALT 也叫得醒
+        final request = chip.request(
+          attempts == 1 ? PICCCommands.reqidl : PICCCommands.reqall,
+        );
         lastStatus = request.status;
         if (request.status == MFRC522Status.ok) {
-          final anticoll = chip.anticoll();
-          lastStatus = anticoll.status;
-          if (anticoll.status == MFRC522Status.ok) {
-            return ReaderScanResult(
-              deviceId: deviceId,
-              status: ReaderScanStatus.card,
-              tagId: uidToHex(anticoll.uid),
-              version: version,
-              timeToReadyMs: readyMs,
-              elapsedMs: stopwatch.elapsedMilliseconds,
-              attempts: attempts,
-            );
+          var anticollRetries = 0;
+          while (true) {
+            final anticoll = chip.anticoll();
+            lastStatus = anticoll.status;
+            if (anticoll.status == MFRC522Status.ok) {
+              return ReaderScanResult(
+                deviceId: deviceId,
+                status: ReaderScanStatus.card,
+                tagId: uidToHex(anticoll.uid),
+                version: version,
+                timeToReadyMs: readyMs,
+                elapsedMs: stopwatch.elapsedMilliseconds,
+                attempts: attempts,
+              );
+            }
+            // 只有校驗或協定錯誤 (卡片還在 READY) 才直接重送 anticoll；
+            // 沒回應就回到外圈重做 REQA/WUPA
+            if (anticoll.status != MFRC522Status.error ||
+                anticollRetries >= t.anticollRetries) {
+              break;
+            }
+            anticollRetries++;
           }
         }
-        // 晶片連 timer IRQ 都沒舉起，代表線路出了問題，重試沒有意義
-        if (lastStatus == MFRC522Status.timeout) break;
+        // 晶片連 timer IRQ 都沒舉起或寫入一直失敗，代表線路出了問題，重試沒有意義
+        if (lastStatus == MFRC522Status.timeout ||
+            lastStatus == MFRC522Status.spiError) {
+          break;
+        }
       }
 
+      final ReaderScanStatus status;
+      if (lastStatus == MFRC522Status.timeout) {
+        status = ReaderScanStatus.commTimeout;
+      } else if (lastStatus == MFRC522Status.spiError) {
+        status = ReaderScanStatus.spiError;
+      } else {
+        status = ReaderScanStatus.noCard;
+      }
       return ReaderScanResult(
         deviceId: deviceId,
-        status: lastStatus == MFRC522Status.timeout
-            ? ReaderScanStatus.commTimeout
-            : ReaderScanStatus.noCard,
+        status: status,
         version: version,
         timeToReadyMs: readyMs,
         elapsedMs: stopwatch.elapsedMilliseconds,

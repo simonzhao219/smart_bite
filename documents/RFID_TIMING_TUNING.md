@@ -238,7 +238,83 @@ dart run scripts/rfid_calibrate.dart set clear
 | 一輪時間忽長忽短 | 某顆在 timeout 邊緣 | `bench --verbose` 找出那顆，檢查接線 |
 | `GPIOerrorCode.gpioErrorOpen` / busy | app 還在跑或上次沒正常結束 | 關 app，跑 `sudo ./scripts/gpio_cleanup.sh` |
 
-## 9. 相關檔案
+## 9. 硬體暫時不能改時的軟體對策
+
+線長造成的問題本質是 SPI 位元錯誤。接線與供電動不了時，軟體還有這幾個槓桿：
+
+### 9.1 驅動層容錯 (預設已開啟)
+
+| 欄位 | 預設 | 做什麼 |
+|---|---|---|
+| `writeVerifyRetries` | 2 | 關鍵暫存器 (timer、ASK、Mode、TxControl、ComIEn、Command、BitFraming、FIFO 內容數) 寫入後讀回驗證，不符就重寫，最多 2 次。偶發的位元錯誤因此只多花幾十微秒 |
+| `anticollRetries` | 2 | UID 的 BCC 校驗失敗時 (卡片還在 READY) 直接重送 anticoll，之後才重做 REQA；第二次起改用 WUPA |
+| `readerRetries` | 1 | 一顆回報線路異常、晶片無回應或 SPI 寫入錯誤時，RST 重新上電再讀一次 |
+
+三個欄位都可以對單顆覆寫。線路正常時它們幾乎不花時間；線路差時每顆最多多
+`readerRetries` 次完整讀取。設定頁的讀卡機列表與 CLI 的摘要會顯示
+`重寫×N` (暫存器重寫次數) 與 `重讀×M` (重新上電次數)，這兩個數字就是每顆線路品質的即時指標：
+長期看到某顆 `重寫` 不是 0，代表那條線在錯誤邊緣，該降時脈或提高驅動力。
+
+新增的狀態「SPI 寫入錯誤」代表重寫之後暫存器仍讀回不符，線路錯誤率已經高到重試也救不了。
+
+### 9.2 提高 Pi 的 GPIO 驅動力
+
+Pi 4 的 GPIO 預設每腳 8 mA，長線加七顆負載會讓 SCK / MOSI 邊緣變慢。
+`scripts/gpio_drive_strength.sh` 用 pigpio 把 GPIO 0 到 27 這一組 pad 調高，
+這是不動接線時最接近「硬體修正」的手段：
+
+```bash
+sudo apt install pigpio                      # 只需一次
+sudo ./scripts/gpio_drive_strength.sh show   # 看目前的值
+sudo ./scripts/gpio_drive_strength.sh 12     # 先試 12 mA
+sudo ./scripts/gpio_drive_strength.sh 16     # 不夠再試 16 mA
+sudo ./scripts/gpio_drive_strength.sh 8      # 還原預設
+```
+
+每改一階就到設定頁按「連線檢測」比較各時脈的錯誤率。驅動力越大邊緣越快，
+但振鈴也越明顯，所以要跟 SPI 時脈一起評估，不是越大越好。
+設定在重開機前有效；要每次開機自動套用，建立一個 systemd 服務：
+
+```ini
+# /etc/systemd/system/gpio-drive-strength.service
+[Unit]
+Description=Raise GPIO pad drive strength for the RC522 SPI bus
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/pi/Desktop/smart_bite/scripts/gpio_drive_strength.sh 12
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now gpio-drive-strength.service
+```
+
+### 9.3 固定核心時脈
+
+Pi 4 的 SPI 時脈由核心時脈分頻而來，核心時脈會隨負載在 200 與 500 MHz 之間切換。
+在 `/boot/firmware/config.txt` (舊系統是 `/boot/config.txt`) 加上：
+
+```
+core_freq=500
+core_freq_min=500
+```
+
+可以避免 SPI 時脈跟著漂移。風險低，代價是待機功耗略高。
+
+### 9.4 期望與極限
+
+- 重試機制能吃掉偶發錯誤 (錯誤率個位數 % 以下)，掃描時間幾乎不受影響。
+- 錯誤率超過一成的線，重試會把時間拉長、偶爾仍會漏讀，那條線最終還是要縮短、
+  改善走線或改成獨立 CS 接法。
+- 判斷方法：連線檢測在 1 MHz 有錯、500 kHz 歸零是訊號問題，先降時脈；
+  各時脈都零錯誤但掃描時常出現「晶片無回應」，是開天線後的供電或地抖動，
+  需要就近供電與電容。
+
+## 10. 相關檔案
 
 | 檔案 | 內容 |
 |---|---|
@@ -251,5 +327,6 @@ dart run scripts/rfid_calibrate.dart set clear
 | `lib/adapters/gpio_spi_rfid_adapter.dart` | Flutter 端：載入與儲存設定、在 isolate 執行掃描 / 連線檢測 / 最佳化 |
 | `lib/widgets/rfid_timing_settings.dart` | 設定頁的卡片、編輯對話框、連線檢測、自動最佳化 UI |
 | `scripts/rfid_calibrate.dart` | Pi 上的 CLI |
+| `scripts/gpio_drive_strength.sh` | 調整 Pi GPIO pad 驅動力 (pigpio) |
 | `test/unit/rfid_optimizer_test.dart` | 用模擬讀卡機驗證演算法 |
 | `test/unit/mfrc522_driver_test.dart` | 用假 transport 驗證驅動與讀取流程 |

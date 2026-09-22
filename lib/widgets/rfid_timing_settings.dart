@@ -426,6 +426,12 @@ String _shortLabel(String key) {
       return 'REQA 次數';
     case 'commDeadlineMs':
       return '牆鐘 ms';
+    case 'writeVerifyRetries':
+      return '重寫';
+    case 'anticollRetries':
+      return 'anticoll 重送';
+    case 'readerRetries':
+      return '重讀';
     default:
       return key;
   }

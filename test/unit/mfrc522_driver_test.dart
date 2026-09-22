@@ -33,6 +33,9 @@ class FakeExchange {
 }
 
 /// 模擬 MFRC522 暫存器行為的假 transport
+///
+/// FIFO 跟真晶片一樣只有一個：寫 FIFODataReg 會累積，FlushBuffer 清空，
+/// 下 transceive 指令後 FIFO 的內容換成卡片的回應。
 class FakeMfrc522Transport implements Mfrc522Transport {
   int version;
 
@@ -44,6 +47,12 @@ class FakeMfrc522Transport implements Mfrc522Transport {
 
   /// 每第 N 次讀取回傳 0x00，模擬偶發的線路錯誤
   int? corruptEveryNthRead;
+
+  /// 接下來幾次寫入「有送出但沒寫進晶片」，模擬 MOSI 的偶發位元錯誤
+  int dropNextWrites = 0;
+
+  /// 這些暫存器的寫入永遠寫不進去
+  Set<int> deadRegisters = {};
 
   final Map<int, int> registers = {};
   final List<(int, int)> writes = [];
@@ -92,12 +101,25 @@ class FakeMfrc522Transport implements Mfrc522Transport {
   @override
   void writeRegister(int register, int value) {
     writes.add((register, value));
-    registers[register] = value;
-    if (register == MFRC522Registers.commandReg &&
-        value == MFRC522Commands.transceive) {
-      _exchangeIndex++;
-      _irqIndex = 0;
-      _fifo = List<int>.from(_exchange.fifo);
+    if (deadRegisters.contains(register)) return;
+    if (dropNextWrites > 0) {
+      dropNextWrites--;
+      return;
+    }
+    switch (register) {
+      case MFRC522Registers.fifoDataReg:
+        _fifo.add(value);
+      case MFRC522Registers.fifoLevelReg:
+        if ((value & 0x80) != 0) _fifo.clear();
+      case MFRC522Registers.commandReg:
+        registers[register] = value;
+        if (value == MFRC522Commands.transceive) {
+          _exchangeIndex++;
+          _irqIndex = 0;
+          _fifo = List<int>.from(_exchange.fifo);
+        }
+      default:
+        registers[register] = value;
     }
   }
 
@@ -114,6 +136,10 @@ class FakeMfrc522Transport implements Mfrc522Transport {
 class FakeResetLine implements ResetLine {
   final List<String> events = [];
   bool isHigh = false;
+  int highCount = 0;
+
+  /// 每次拉高時呼叫 (第幾次拉高)，測試用來模擬「第二次上電才正常」
+  void Function(int highCount)? onHigh;
 
   @override
   void open() => events.add('open');
@@ -121,7 +147,9 @@ class FakeResetLine implements ResetLine {
   @override
   void high() {
     isHigh = true;
+    highCount++;
     events.add('high');
+    onHigh?.call(highCount);
   }
 
   @override
@@ -134,7 +162,7 @@ class FakeResetLine implements ResetLine {
   void dispose() => events.add('dispose');
 }
 
-/// 測試用的快速時序：等待值都很短，效果跟真實設定一樣
+/// 測試用的快速時序：等待值都很短，效果跟真實設定一樣；不重新上電
 const fastTiming = RfidTimingConfig(
   rstSettleMs: 1,
   linkCheckTimeoutMs: 2,
@@ -143,10 +171,24 @@ const fastTiming = RfidTimingConfig(
   reqaAttempts: 2,
   commDeadlineMs: 5,
   interReaderGapMs: 0,
+  readerRetries: 0,
 );
 
 const cardUid = [0xA2, 0x20, 0x38, 0xF6];
 const cardBcc = 0xA2 ^ 0x20 ^ 0x38 ^ 0xF6;
+
+SimpleMFRC522 reader(
+  FakeMfrc522Transport bus, {
+  FakeResetLine? reset,
+  RfidTimingConfig timing = fastTiming,
+  int deviceNum = 1,
+}) =>
+    SimpleMFRC522(
+      deviceNum: deviceNum,
+      resetLine: reset ?? FakeResetLine(),
+      transport: bus,
+      timing: timing,
+    );
 
 void main() {
   group('MFRC522.communicate', () {
@@ -216,12 +258,62 @@ void main() {
       expect(bus.writes.last.$1, MFRC522Registers.bitFramingReg);
       expect(bus.writes.last.$2 & 0x80, 0);
     });
+
+    test('FIFO 寫入一直寫不進去時回 spiError，不啟動指令', () {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04, 0x00])
+        ],
+      )..deadRegisters = {MFRC522Registers.fifoDataReg};
+      final chip = MFRC522(bus, writeVerifyRetries: 2);
+      final reply = chip.communicate(MFRC522Commands.transceive, [0x26]);
+      expect(reply.status, MFRC522Status.spiError);
+      expect(bus.transceiveCount, 0);
+      expect(chip.verifyRetries, 2);
+    });
+
+    test('偶發一次寫入遺失會重寫後成功', () {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04, 0x00])
+        ],
+      )..dropNextWrites = 1;
+      final chip = MFRC522(bus);
+      final reply = chip.communicate(MFRC522Commands.transceive, [0x26]);
+      expect(reply.status, MFRC522Status.ok);
+      expect(chip.verifyRetries, 1);
+    });
   });
 
   group('MFRC522 register helpers', () {
+    test('writeRegisterVerified 讀回不符會重寫，超過次數回 false', () {
+      final bus = FakeMfrc522Transport()..dropNextWrites = 2;
+      final chip = MFRC522(bus, writeVerifyRetries: 2);
+      expect(chip.writeRegisterVerified(MFRC522Registers.modWidthReg, 0x26),
+          isTrue);
+      expect(chip.verifyRetries, 2);
+
+      bus.deadRegisters = {MFRC522Registers.modWidthReg};
+      expect(chip.writeRegisterVerified(MFRC522Registers.modWidthReg, 0x27),
+          isFalse);
+      expect(chip.verifyRetries, 4);
+    });
+
+    test('writeRegisterVerified 只比對有定義的位元', () {
+      final bus = FakeMfrc522Transport();
+      final chip = MFRC522(bus);
+      // 模擬保留位元讀回為 0：ModeReg 寫 0x3D，讀回 0x29 也算通過
+      bus.registers[MFRC522Registers.modeReg] = 0;
+      bus.deadRegisters = {MFRC522Registers.modeReg};
+      bus.registers[MFRC522Registers.modeReg] = 0x3D & 0xAB;
+      expect(
+          chip.writeRegisterVerified(MFRC522Registers.modeReg, 0x3D), isTrue);
+      expect(chip.verifyRetries, 0);
+    });
+
     test('setTimerTimeout 換算成 25 µs 的 tick 數', () {
       final bus = FakeMfrc522Transport();
-      MFRC522(bus).setTimerTimeout(25);
+      expect(MFRC522(bus).setTimerTimeout(25), isTrue);
       // 25 ms × 40 = 1000 = 0x03E8
       expect(bus.wrote(MFRC522Registers.tModeReg, 0x80), isTrue);
       expect(bus.wrote(MFRC522Registers.tPrescalerReg, 0xA9), isTrue);
@@ -238,10 +330,20 @@ void main() {
 
     test('configure 會設定 ASK、CRC 預設值並開天線', () {
       final bus = FakeMfrc522Transport();
-      MFRC522(bus).configure(reqaTimeoutMs: 25);
+      expect(MFRC522(bus).configure(reqaTimeoutMs: 25), isTrue);
       expect(bus.wrote(MFRC522Registers.txASKReg, 0x40), isTrue);
       expect(bus.wrote(MFRC522Registers.modeReg, 0x3D), isTrue);
       expect(bus.registers[MFRC522Registers.txControlReg]! & 0x03, 0x03);
+    });
+
+    test('configure 有暫存器寫不進去時回 false', () {
+      final bus = FakeMfrc522Transport()
+        ..deadRegisters = {MFRC522Registers.txASKReg};
+      final chip = MFRC522(bus, writeVerifyRetries: 1);
+      expect(chip.configure(reqaTimeoutMs: 25), isFalse);
+      expect(chip.verifyRetries, 1);
+      // 其他暫存器照常設定
+      expect(bus.registers[MFRC522Registers.modeReg], 0x3D);
     });
 
     test('antennaOff 清掉 TX1/TX2', () {
@@ -298,14 +400,7 @@ void main() {
         ],
       );
       final reset = FakeResetLine();
-      final reader = SimpleMFRC522(
-        deviceNum: 3,
-        resetLine: reset,
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final result = await reader.scanOnce();
+      final result = await reader(bus, reset: reset, deviceNum: 3).scanOnce();
 
       expect(result.deviceId, '03');
       expect(result.status, ReaderScanStatus.card);
@@ -314,26 +409,24 @@ void main() {
       expect(result.tagId, 'A22038F6');
       expect(result.version, MFRC522Version.v2);
       expect(result.attempts, 1);
+      expect(result.spiRetries, 0);
+      expect(result.rereads, 0);
       expect(result.timeToReadyMs, isNotNull);
       expect(reset.events, ['high', 'low']);
       expect(reset.isHigh, isFalse);
       // 離開前天線關閉
       expect(bus.registers[MFRC522Registers.txControlReg]! & 0x03, 0);
       expect(result.summary, contains('A22038F6'));
+      // 第一次用 REQA
+      expect(
+          bus.wrote(MFRC522Registers.fifoDataReg, PICCCommands.reqidl), isTrue);
     });
 
-    test('沒有卡片：REQA 會重試到設定的次數', () async {
+    test('沒有卡片：REQA 會重試到設定的次數，第二次起用 WUPA', () async {
       final bus = FakeMfrc522Transport(
         exchanges: const [FakeExchange.noTag()],
       );
-      final reader = SimpleMFRC522(
-        deviceNum: 1,
-        resetLine: FakeResetLine(),
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final result = await reader.scanOnce();
+      final result = await reader(bus).scanOnce();
 
       expect(result.status, ReaderScanStatus.noCard);
       expect(result.hasCard, isFalse);
@@ -341,6 +434,8 @@ void main() {
       expect(result.attempts, fastTiming.reqaAttempts);
       expect(bus.transceiveCount, fastTiming.reqaAttempts);
       expect(result.error, isNull);
+      expect(
+          bus.wrote(MFRC522Registers.fifoDataReg, PICCCommands.reqall), isTrue);
     });
 
     test('第二次 REQA 才成功', () async {
@@ -351,35 +446,55 @@ void main() {
           FakeExchange.ok([...cardUid, cardBcc]),
         ],
       );
-      final reader = SimpleMFRC522(
-        deviceNum: 1,
-        resetLine: FakeResetLine(),
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final result = await reader.scanOnce();
+      final result = await reader(bus).scanOnce();
       expect(result.status, ReaderScanStatus.card);
       expect(result.attempts, 2);
+    });
+
+    test('anticoll 校驗失敗會直接重送 anticoll，不重做 REQA', () async {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04, 0x00]),
+          FakeExchange.ok([...cardUid, 0x00]), // BCC 錯
+          FakeExchange.ok([...cardUid, cardBcc]),
+        ],
+      );
+      final result = await reader(bus).scanOnce();
+      expect(result.status, ReaderScanStatus.card);
+      expect(result.tagId, 'A22038F6');
+      expect(result.attempts, 1);
+      expect(bus.transceiveCount, 3);
+    });
+
+    test('anticollRetries = 0 時退回外圈重做 REQA/WUPA', () async {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04, 0x00]),
+          FakeExchange.ok([...cardUid, 0x00]), // BCC 錯
+          FakeExchange.ok([0x04, 0x00]),
+          FakeExchange.ok([...cardUid, cardBcc]),
+        ],
+      );
+      final result = await reader(
+        bus,
+        timing: fastTiming.copyWith(anticollRetries: 0),
+      ).scanOnce();
+      expect(result.status, ReaderScanStatus.card);
+      expect(result.attempts, 2);
+      expect(bus.transceiveCount, 4);
     });
 
     test('VersionReg 讀不到：直接回線路異常，不送 REQA，RST 仍會拉低', () async {
       final bus = FakeMfrc522Transport(version: 0x00);
       final reset = FakeResetLine();
-      final reader = SimpleMFRC522(
-        deviceNum: 7,
-        resetLine: reset,
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final result = await reader.scanOnce();
+      final result = await reader(bus, reset: reset, deviceNum: 7).scanOnce();
 
       expect(result.status, ReaderScanStatus.linkError);
       expect(result.linkOk, isFalse);
       expect(result.hasCard, isFalse);
       expect(result.version, 0x00);
       expect(result.error, contains('VersionReg'));
+      expect(result.rereads, 0);
       expect(bus.transceiveCount, 0);
       expect(reset.events.last, 'low');
       // 有等到 rstSettleMs + linkCheckTimeoutMs 才放棄
@@ -391,19 +506,49 @@ void main() {
       );
     });
 
+    test('readerRetries：第一次上電讀不到，重新上電後讀到卡片', () async {
+      final bus = FakeMfrc522Transport(
+        version: 0x00,
+        exchanges: const [
+          FakeExchange.ok([0x04, 0x00]),
+          FakeExchange.ok([...cardUid, cardBcc]),
+        ],
+      );
+      final reset = FakeResetLine()
+        ..onHigh = (count) {
+          if (count == 2) bus.version = MFRC522Version.v2;
+        };
+      final result = await reader(
+        bus,
+        reset: reset,
+        timing: fastTiming.copyWith(readerRetries: 1),
+      ).scanOnce();
+
+      expect(result.status, ReaderScanStatus.card);
+      expect(result.rereads, 1);
+      expect(reset.highCount, 2);
+      expect(reset.events, ['high', 'low', 'high', 'low']);
+    });
+
+    test('readerRetries 用完仍失敗就回報最後一次的狀態', () async {
+      final bus = FakeMfrc522Transport(version: 0xFF);
+      final reset = FakeResetLine();
+      final result = await reader(
+        bus,
+        reset: reset,
+        timing: fastTiming.copyWith(readerRetries: 2),
+      ).scanOnce();
+      expect(result.status, ReaderScanStatus.linkError);
+      expect(result.rereads, 2);
+      expect(reset.highCount, 3);
+    });
+
     test('晶片有回應但送指令後沒有任何 IRQ：回 commTimeout 且不重試', () async {
       final bus = FakeMfrc522Transport(
         exchanges: const [FakeExchange.dead()],
       );
-      final reader = SimpleMFRC522(
-        deviceNum: 2,
-        resetLine: FakeResetLine(),
-        transport: bus,
-        timing: fastTiming,
-      );
-
       final stopwatch = Stopwatch()..start();
-      final result = await reader.scanOnce();
+      final result = await reader(bus, deviceNum: 2).scanOnce();
       stopwatch.stop();
 
       expect(result.status, ReaderScanStatus.commTimeout);
@@ -414,30 +559,63 @@ void main() {
       expect(stopwatch.elapsedMilliseconds, lessThan(150));
     });
 
-    test('transport 拋例外時回 error 且 RST 拉低', () async {
+    test('暫存器一直寫不進去：回 spiError，重新上電也一樣，重寫次數有記錄', () async {
+      final bus = FakeMfrc522Transport()
+        ..deadRegisters = {MFRC522Registers.txControlReg};
       final reset = FakeResetLine();
-      final reader = SimpleMFRC522(
+      final result = await reader(
+        bus,
+        reset: reset,
+        timing: fastTiming.copyWith(readerRetries: 1),
+      ).scanOnce();
+
+      expect(result.status, ReaderScanStatus.spiError);
+      expect(result.linkOk, isFalse);
+      expect(result.rereads, 1);
+      expect(result.spiRetries, greaterThan(0));
+      expect(result.error, contains('讀回不符'));
+      expect(result.summary, contains('重寫×'));
+      expect(bus.transceiveCount, 0);
+      expect(reset.events.last, 'low');
+    });
+
+    test('偶發的寫入遺失只增加重寫次數，仍讀到卡片', () async {
+      final bus = FakeMfrc522Transport(
+        exchanges: const [
+          FakeExchange.ok([0x04, 0x00]),
+          FakeExchange.ok([...cardUid, cardBcc]),
+        ],
+      )..dropNextWrites = 3;
+      // 讓「寫 0 被遺失」也看得出來：先把前兩個會寫 0 的暫存器填成 0xFF
+      bus.registers[MFRC522Registers.txModeReg] = 0xFF;
+      bus.registers[MFRC522Registers.rxModeReg] = 0xFF;
+      final result = await reader(bus).scanOnce();
+      expect(result.status, ReaderScanStatus.card);
+      expect(result.spiRetries, 3);
+      expect(result.rereads, 0);
+    });
+
+    test('transport 拋例外時回 error 且 RST 拉低，不重新上電', () async {
+      final reset = FakeResetLine();
+      final result = await SimpleMFRC522(
         deviceNum: 4,
         resetLine: reset,
         transport: _ThrowingTransport(),
-        timing: fastTiming,
-      );
+        timing: fastTiming.copyWith(readerRetries: 2),
+      ).scanOnce();
 
-      final result = await reader.scanOnce();
       expect(result.status, ReaderScanStatus.error);
       expect(result.error, contains('boom'));
+      expect(result.rereads, 0);
       expect(reset.events.last, 'low');
+      expect(reset.highCount, 1);
     });
 
     test('dispose 會拉低並釋放 RST', () async {
       final reset = FakeResetLine();
-      final reader = SimpleMFRC522(
-        deviceNum: 1,
-        resetLine: reset,
-        transport: FakeMfrc522Transport(),
-      );
-      reader.open();
-      await reader.dispose();
+      final r = reader(FakeMfrc522Transport(), reset: reset);
+      r.open();
+      await r.dispose();
       expect(reset.events, ['open', 'low', 'dispose']);
     });
   });
@@ -446,14 +624,8 @@ void main() {
     test('線路正常：量到就緒時間且零錯誤', () async {
       final bus = FakeMfrc522Transport(version: MFRC522Version.v1);
       final reset = FakeResetLine();
-      final reader = SimpleMFRC522(
-        deviceNum: 5,
-        resetLine: reset,
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final probe = await reader.probeLink(samples: 20);
+      final probe =
+          await reader(bus, reset: reset, deviceNum: 5).probeLink(samples: 20);
 
       expect(probe.ready, isTrue);
       expect(probe.clean, isTrue);
@@ -465,14 +637,7 @@ void main() {
 
     test('偶發錯誤會被統計出來', () async {
       final bus = FakeMfrc522Transport()..corruptEveryNthRead = 7;
-      final reader = SimpleMFRC522(
-        deviceNum: 5,
-        resetLine: FakeResetLine(),
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final probe = await reader.probeLink(samples: 50);
+      final probe = await reader(bus, deviceNum: 5).probeLink(samples: 50);
       expect(probe.ready, isTrue);
       expect(probe.mismatches, greaterThan(0));
       expect(probe.clean, isFalse);
@@ -481,14 +646,8 @@ void main() {
 
     test('一直讀不到 VersionReg：未就緒，樣本數為 0', () async {
       final bus = FakeMfrc522Transport(version: 0xFF);
-      final reader = SimpleMFRC522(
-        deviceNum: 6,
-        resetLine: FakeResetLine(),
-        transport: bus,
-        timing: fastTiming,
-      );
-
-      final probe = await reader.probeLink(samples: 10, maxReadyMs: 5);
+      final probe =
+          await reader(bus, deviceNum: 6).probeLink(samples: 10, maxReadyMs: 5);
       expect(probe.ready, isFalse);
       expect(probe.clean, isFalse);
       expect(probe.samples, 0);
@@ -506,6 +665,8 @@ void main() {
         timeToReadyMs: 3,
         elapsedMs: 41,
         attempts: 1,
+        spiRetries: 2,
+        rereads: 1,
       );
       final restored = ReaderScanResult.fromJson(original.toJson());
       expect(restored.deviceId, '02');
@@ -515,7 +676,10 @@ void main() {
       expect(restored.timeToReadyMs, 3);
       expect(restored.elapsedMs, 41);
       expect(restored.attempts, 1);
+      expect(restored.spiRetries, 2);
+      expect(restored.rereads, 1);
       expect(restored.hasCard, isTrue);
+      expect(restored.summary, contains('重讀×1'));
     });
 
     test('未知的 status 名稱視為 error', () {

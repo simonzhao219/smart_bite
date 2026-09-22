@@ -3,9 +3,12 @@
 /// 暫存器讀寫透過 [Mfrc522Transport] 抽象：正式環境用 SPI，
 /// 單元測試用假物件模擬晶片行為。
 ///
-/// 跟舊版最大的差別：等待 IRQ 的迴圈改用「牆鐘時間」當上限，
-/// 而不是固定讀 2000 次暫存器。線路不好時舊版會把 2000 次讀完
-/// (每次都是一個 SPI ioctl，一次約 0.1 到 0.2 秒)，掃描時間因此隨線長浮動。
+/// 跟舊版最大的差別：
+/// - 等待 IRQ 的迴圈改用「牆鐘時間」當上限，而不是固定讀 2000 次暫存器。
+///   線路不好時舊版會把 2000 次讀完 (每次都是一個 SPI ioctl，一次約 0.1 到 0.2 秒)，
+///   掃描時間因此隨線長浮動。
+/// - 關鍵暫存器寫入後會讀回驗證，不符就重寫 ([writeRegisterVerified])。
+///   長線造成的偶發位元錯誤因此只會多花幾十微秒，而不是讓整顆讀卡機這一輪讀不到。
 library;
 
 import 'dart:typed_data';
@@ -52,7 +55,34 @@ class MFRC522 {
   /// 每次讀取前可以依當次生效的時序設定重新指定。
   int commDeadlineMs;
 
-  MFRC522(this.bus, {this.commDeadlineMs = 36});
+  /// 關鍵暫存器寫入後讀回不符時，最多重寫幾次
+  int writeVerifyRetries;
+
+  /// 累計的重寫次數 (診斷用)，由呼叫端在每次讀卡前歸零
+  int verifyRetries = 0;
+
+  MFRC522(
+    this.bus, {
+    this.commDeadlineMs = 36,
+    this.writeVerifyRetries = 2,
+  });
+
+  /// 各暫存器讀回驗證時要比對的位元：保留位元讀回值不保證跟寫入相同，必須排除
+  static const Map<int, int> verifyMasks = {
+    MFRC522Registers.commandReg: 0x3F, // bit 7..6 保留
+    MFRC522Registers.comIEnReg: 0xFF,
+    MFRC522Registers.bitFramingReg: 0x77, // bit 7 StartSend 自清、bit 3 保留
+    MFRC522Registers.modeReg: 0xAB, // bit 6、4、2 保留
+    MFRC522Registers.txModeReg: 0xF8, // bit 2..0 保留
+    MFRC522Registers.rxModeReg: 0xFC, // bit 1..0 保留
+    MFRC522Registers.txControlReg: 0x03, // 只驗證 Tx1RFEn / Tx2RFEn
+    MFRC522Registers.txASKReg: 0x40, // 只有 Force100ASK 有定義
+    MFRC522Registers.modWidthReg: 0xFF,
+    MFRC522Registers.tModeReg: 0xFF,
+    MFRC522Registers.tPrescalerReg: 0xFF,
+    MFRC522Registers.tReloadRegH: 0xFF,
+    MFRC522Registers.tReloadRegL: 0xFF,
+  };
 
   int readRegister(int register) => bus.readRegister(register);
 
@@ -67,6 +97,18 @@ class MFRC522 {
   void clearBitMask(int register, int mask) {
     final current = readRegister(register);
     writeRegister(register, current & (~mask) & 0xFF);
+  }
+
+  /// 寫入後讀回驗證，只比對 [mask] 的位元 (不給就用 [verifyMasks])。
+  /// 不符就重寫，最多 [writeVerifyRetries] 次；最後仍不符回 false。
+  bool writeRegisterVerified(int register, int value, {int? mask}) {
+    final bits = mask ?? verifyMasks[register] ?? 0xFF;
+    for (var attempt = 0;; attempt++) {
+      writeRegister(register, value);
+      if ((readRegister(register) & bits) == (value & bits)) return true;
+      if (attempt >= writeVerifyRetries) return false;
+      verifyRetries++;
+    }
   }
 
   /// 讀 VersionReg。正常為 0x91 或 0x92；0x00 / 0xFF 代表 MISO 沒接到晶片。
@@ -91,39 +133,79 @@ class MFRC522 {
   }
 
   /// 硬體 reset 之後的暫存器設定，順序與 Arduino MFRC522 library 的 PCD_Init 相同。
-  void configure({int reqaTimeoutMs = 25}) {
-    writeRegister(MFRC522Registers.txModeReg, 0x00);
-    writeRegister(MFRC522Registers.rxModeReg, 0x00);
-    writeRegister(MFRC522Registers.modWidthReg, 0x26);
-    setTimerTimeout(reqaTimeoutMs);
+  /// 每個寫入都讀回驗證；回 false 代表有暫存器重寫之後仍然不符 (線路很差)。
+  bool configure({int reqaTimeoutMs = 25}) {
+    var ok = writeRegisterVerified(MFRC522Registers.txModeReg, 0x00);
+    ok = writeRegisterVerified(MFRC522Registers.rxModeReg, 0x00) && ok;
+    ok = writeRegisterVerified(MFRC522Registers.modWidthReg, 0x26) && ok;
+    ok = setTimerTimeout(reqaTimeoutMs) && ok;
     // 強制 100% ASK 調變
-    writeRegister(MFRC522Registers.txASKReg, 0x40);
+    ok = writeRegisterVerified(MFRC522Registers.txASKReg, 0x40) && ok;
     // CRC 預設值 0x6363
-    writeRegister(MFRC522Registers.modeReg, 0x3D);
-    antennaOn();
+    ok = writeRegisterVerified(MFRC522Registers.modeReg, 0x3D) && ok;
+    ok = antennaOn() && ok;
+    return ok;
   }
 
   /// 設定晶片內部 timer 的逾時，傳送結束後自動起算 (TAuto=1)。
   ///
   /// TPrescaler = 0x0A9 = 169 → f_timer = 13.56 MHz / (2×169+1) ≈ 40 kHz，
   /// 每個 tick 25 µs，所以 ticks = ms × 40。上限 0xFFFF ≈ 1638 ms。
-  void setTimerTimeout(int milliseconds) {
+  bool setTimerTimeout(int milliseconds) {
     final ticks = (milliseconds * 40).clamp(1, 0xFFFF);
-    writeRegister(MFRC522Registers.tModeReg, 0x80);
-    writeRegister(MFRC522Registers.tPrescalerReg, 0xA9);
-    writeRegister(MFRC522Registers.tReloadRegH, (ticks >> 8) & 0xFF);
-    writeRegister(MFRC522Registers.tReloadRegL, ticks & 0xFF);
+    var ok = writeRegisterVerified(MFRC522Registers.tModeReg, 0x80);
+    ok = writeRegisterVerified(MFRC522Registers.tPrescalerReg, 0xA9) && ok;
+    ok = writeRegisterVerified(
+          MFRC522Registers.tReloadRegH,
+          (ticks >> 8) & 0xFF,
+        ) &&
+        ok;
+    ok =
+        writeRegisterVerified(MFRC522Registers.tReloadRegL, ticks & 0xFF) && ok;
+    return ok;
   }
 
-  void antennaOn() {
+  /// 開天線並確認 Tx1RFEn / Tx2RFEn 真的有設上
+  bool antennaOn() {
     final current = readRegister(MFRC522Registers.txControlReg);
-    if ((current & 0x03) != 0x03) {
-      writeRegister(MFRC522Registers.txControlReg, current | 0x03);
-    }
+    if ((current & 0x03) == 0x03) return true;
+    return writeRegisterVerified(
+      MFRC522Registers.txControlReg,
+      current | 0x03,
+      mask: 0x03,
+    );
   }
 
   void antennaOff() {
     clearBitMask(MFRC522Registers.txControlReg, 0x03);
+  }
+
+  /// FlushBuffer 之後 FIFOLevel 應為 0
+  bool _flushFifoVerified() {
+    for (var attempt = 0;; attempt++) {
+      writeRegister(MFRC522Registers.fifoLevelReg, 0x80);
+      if ((readRegister(MFRC522Registers.fifoLevelReg) & 0x7F) == 0) {
+        return true;
+      }
+      if (attempt >= writeVerifyRetries) return false;
+      verifyRetries++;
+    }
+  }
+
+  /// 把要送的資料寫進 FIFO，並確認 FIFOLevel 等於送出的 byte 數
+  bool _loadFifoVerified(List<int> sendData) {
+    for (var attempt = 0;; attempt++) {
+      for (final byte in sendData) {
+        writeRegister(MFRC522Registers.fifoDataReg, byte & 0xFF);
+      }
+      if ((readRegister(MFRC522Registers.fifoLevelReg) & 0x7F) ==
+          sendData.length) {
+        return true;
+      }
+      if (attempt >= writeVerifyRetries) return false;
+      verifyRetries++;
+      if (!_flushFifoVerified()) return false;
+    }
   }
 
   /// 送指令給晶片並等待完成。
@@ -133,6 +215,7 @@ class MFRC522 {
   /// - [MFRC522Status.notag]：晶片 timer 逾時，代表晶片正常但場內沒有卡
   /// - [MFRC522Status.timeout]：牆鐘上限內晶片連 timer IRQ 都沒舉起，
   ///   通常是 SPI 線路或供電問題
+  /// - [MFRC522Status.spiError]：準備階段的暫存器寫入重寫後仍讀回不符
   /// - [MFRC522Status.error]：ErrorReg 有 BufferOvfl / CollErr / ParityErr / ProtocolErr
   Mfrc522Reply communicate(
     int command,
@@ -149,18 +232,29 @@ class MFRC522 {
       waitIRq = 0x30;
     }
 
-    writeRegister(MFRC522Registers.comIEnReg, irqEn | 0x80);
-    // Set1 = 0 且其餘位元為 1：清掉全部七個 IRQ 旗標
-    writeRegister(MFRC522Registers.comIrqReg, 0x7F);
-    // FlushBuffer
-    writeRegister(MFRC522Registers.fifoLevelReg, 0x80);
-    writeRegister(MFRC522Registers.commandReg, MFRC522Commands.idle);
+    const failed = (
+      status: MFRC522Status.spiError,
+      backData: <int>[],
+      backLen: 0,
+    );
 
-    for (final byte in sendData) {
-      writeRegister(MFRC522Registers.fifoDataReg, byte & 0xFF);
+    // 準備階段的寫入都讀回驗證；重寫後仍不符就不要啟動指令
+    if (!writeRegisterVerified(MFRC522Registers.comIEnReg, irqEn | 0x80)) {
+      return failed;
     }
-
-    writeRegister(MFRC522Registers.commandReg, command);
+    // Set1 = 0 且其餘位元為 1：清掉全部七個 IRQ 旗標 (寫入語意特殊，不讀回驗證)
+    writeRegister(MFRC522Registers.comIrqReg, 0x7F);
+    if (!_flushFifoVerified()) return failed;
+    if (!writeRegisterVerified(
+      MFRC522Registers.commandReg,
+      MFRC522Commands.idle,
+    )) {
+      return failed;
+    }
+    if (!_loadFifoVerified(sendData)) return failed;
+    if (!writeRegisterVerified(MFRC522Registers.commandReg, command)) {
+      return failed;
+    }
     if (command == MFRC522Commands.transceive) {
       // StartSend
       setBitMask(MFRC522Registers.bitFramingReg, 0x80);
@@ -201,7 +295,7 @@ class MFRC522 {
       return (status: MFRC522Status.ok, backData: const <int>[], backLen: 0);
     }
 
-    var count = readRegister(MFRC522Registers.fifoLevelReg);
+    var count = readRegister(MFRC522Registers.fifoLevelReg) & 0x7F;
     final lastBits = readRegister(MFRC522Registers.controlReg) & 0x07;
     final backLen = lastBits != 0 ? (count - 1) * 8 + lastBits : count * 8;
     if (count == 0) count = 1;
@@ -217,7 +311,9 @@ class MFRC522 {
   /// REQA / WUPA：找場內的卡片，成功會收到 2 bytes ATQA (16 bits)
   ({int status, List<int> backBits}) request(int reqMode) {
     // 只送 7 個 bit
-    writeRegister(MFRC522Registers.bitFramingReg, 0x07);
+    if (!writeRegisterVerified(MFRC522Registers.bitFramingReg, 0x07)) {
+      return (status: MFRC522Status.spiError, backBits: const <int>[]);
+    }
     final reply = communicate(MFRC522Commands.transceive, [reqMode]);
 
     if (reply.status != MFRC522Status.ok) {
@@ -231,7 +327,9 @@ class MFRC522 {
 
   /// Anti-collision (cascade level 1)：取得 4 bytes UID 加 1 byte BCC
   ({int status, List<int> uid}) anticoll() {
-    writeRegister(MFRC522Registers.bitFramingReg, 0x00);
+    if (!writeRegisterVerified(MFRC522Registers.bitFramingReg, 0x00)) {
+      return (status: MFRC522Status.spiError, uid: const <int>[]);
+    }
     final reply = communicate(
       MFRC522Commands.transceive,
       [PICCCommands.anticoll, 0x20],

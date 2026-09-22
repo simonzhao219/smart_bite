@@ -122,6 +122,15 @@ class RfidTimingConfig {
   /// 整輪掃描的逾時 (秒)，超過就視為硬體卡死並回報錯誤。
   final int scanTimeoutSec;
 
+  /// 關鍵暫存器寫入後讀回不符時最多重寫幾次。長線的偶發位元錯誤靠這個吃掉。
+  final int writeVerifyRetries;
+
+  /// anticoll 校驗失敗 (卡片還在 READY) 時最多直接重送幾次，之後才重做 REQA。
+  final int anticollRetries;
+
+  /// 一顆回報線路異常、晶片無回應或 SPI 寫入錯誤時，重新上電再讀幾次。
+  final int readerRetries;
+
   /// 每顆讀卡機的覆寫值：deviceId ("01"…"07") → {欄位: 值}。
   /// 只允許 [perReaderKeys] 裡的欄位，其他會被忽略。
   final Map<String, Map<String, int>> readerOverrides;
@@ -137,6 +146,9 @@ class RfidTimingConfig {
     this.interReaderGapMs = 1,
     this.postScanSettleMs = 0,
     this.scanTimeoutSec = 10,
+    this.writeVerifyRetries = 2,
+    this.anticollRetries = 2,
+    this.readerRetries = 1,
     this.readerOverrides = const {},
   });
 
@@ -155,6 +167,9 @@ class RfidTimingConfig {
     'interReaderGapMs',
     'postScanSettleMs',
     'scanTimeoutSec',
+    'writeVerifyRetries',
+    'anticollRetries',
+    'readerRetries',
   ];
 
   /// 可以對單顆讀卡機覆寫的欄位
@@ -165,6 +180,9 @@ class RfidTimingConfig {
     'reqaTimeoutMs',
     'reqaAttempts',
     'commDeadlineMs',
+    'writeVerifyRetries',
+    'anticollRetries',
+    'readerRetries',
   ];
 
   /// 每個欄位允許的範圍 (含)
@@ -179,6 +197,9 @@ class RfidTimingConfig {
     'interReaderGapMs': (0, 1000),
     'postScanSettleMs': (0, 5000),
     'scanTimeoutSec': (1, 120),
+    'writeVerifyRetries': (0, 5),
+    'anticollRetries': (0, 5),
+    'readerRetries': (0, 3),
   };
 
   /// 每個欄位的中文說明，給設定頁與 CLI 用
@@ -193,6 +214,9 @@ class RfidTimingConfig {
     'interReaderGapMs': '讀卡機之間間隔 (ms)',
     'postScanSettleMs': '整輪結束後等待 (ms)',
     'scanTimeoutSec': '整輪逾時 (秒)',
+    'writeVerifyRetries': '暫存器重寫次數',
+    'anticollRetries': 'anticoll 重送次數',
+    'readerRetries': '重新上電再讀次數',
   };
 
   /// 每個欄位的一句話說明，給設定頁的編輯表單用
@@ -207,6 +231,9 @@ class RfidTimingConfig {
     'interReaderGapMs': '兩顆之間的間隔。',
     'postScanSettleMs': '整輪結束後的額外等待。',
     'scanTimeoutSec': '整輪超過這個時間視為硬體卡死。會自動 ≥ 最壞情況 × 2。',
+    'writeVerifyRetries': '寫入後讀回不符就重寫，吃掉長線的偶發位元錯誤。0 = 不驗證重寫。',
+    'anticollRetries': 'UID 校驗失敗時直接重送 anticoll 的次數，之後才重做 REQA。',
+    'readerRetries': '線路異常、無回應或 SPI 錯誤時，重新上電再讀的次數。',
   };
 
   /// 軟體等待 IRQ 的實際上限
@@ -236,6 +263,9 @@ class RfidTimingConfig {
         'interReaderGapMs': interReaderGapMs,
         'postScanSettleMs': postScanSettleMs,
         'scanTimeoutSec': scanTimeoutSec,
+        'writeVerifyRetries': writeVerifyRetries,
+        'anticollRetries': anticollRetries,
+        'readerRetries': readerRetries,
       };
 
   /// 全域欄位加上 `readers` 區段 (沒有覆寫時省略)
@@ -289,6 +319,9 @@ class RfidTimingConfig {
       interReaderGapMs: pick('interReaderGapMs', base.interReaderGapMs),
       postScanSettleMs: pick('postScanSettleMs', base.postScanSettleMs),
       scanTimeoutSec: pick('scanTimeoutSec', base.scanTimeoutSec),
+      writeVerifyRetries: pick('writeVerifyRetries', base.writeVerifyRetries),
+      anticollRetries: pick('anticollRetries', base.anticollRetries),
+      readerRetries: pick('readerRetries', base.readerRetries),
       readerOverrides: overrides,
     );
   }
@@ -381,6 +414,9 @@ class RfidTimingConfig {
     int? interReaderGapMs,
     int? postScanSettleMs,
     int? scanTimeoutSec,
+    int? writeVerifyRetries,
+    int? anticollRetries,
+    int? readerRetries,
     Map<String, Map<String, int>>? readerOverrides,
   }) {
     return RfidTimingConfig(
@@ -394,6 +430,9 @@ class RfidTimingConfig {
       interReaderGapMs: interReaderGapMs ?? this.interReaderGapMs,
       postScanSettleMs: postScanSettleMs ?? this.postScanSettleMs,
       scanTimeoutSec: scanTimeoutSec ?? this.scanTimeoutSec,
+      writeVerifyRetries: writeVerifyRetries ?? this.writeVerifyRetries,
+      anticollRetries: anticollRetries ?? this.anticollRetries,
+      readerRetries: readerRetries ?? this.readerRetries,
       readerOverrides: readerOverrides ?? this.readerOverrides,
     );
   }
@@ -551,14 +590,15 @@ class RfidTimingConfig {
       2;
 
   /// 最壞情況一顆讀卡機的估計時間 (ms)：用到連線檢查的保險時間、
-  /// 每次 REQA 都等到軟體牆鐘上限
-  static int worstCaseReaderMs(RfidTimingConfig timing) =>
-      timing.rstSettleMs +
-      timing.linkCheckTimeoutMs +
-      timing.antennaSettleMs +
-      timing.effectiveCommDeadlineMs * timing.reqaAttempts +
-      timing.interReaderGapMs +
-      perReaderOverheadMs;
+  /// 每次 REQA 都等到軟體牆鐘上限，而且每次都重新上電重讀到上限
+  static int worstCaseReaderMs(RfidTimingConfig timing) {
+    final perAttempt = timing.rstSettleMs +
+        timing.linkCheckTimeoutMs +
+        timing.antennaSettleMs +
+        timing.effectiveCommDeadlineMs * timing.reqaAttempts +
+        perReaderOverheadMs;
+    return perAttempt * (1 + timing.readerRetries) + timing.interReaderGapMs;
+  }
 
   /// 估算無卡時一輪掃描的時間 (ms)，只用全域值 (不看覆寫)
   int estimateNoCardScanMs(int readerCount) =>
@@ -624,6 +664,9 @@ class RfidTimingConfig {
       other.interReaderGapMs == interReaderGapMs &&
       other.postScanSettleMs == postScanSettleMs &&
       other.scanTimeoutSec == scanTimeoutSec &&
+      other.writeVerifyRetries == writeVerifyRetries &&
+      other.anticollRetries == anticollRetries &&
+      other.readerRetries == readerRetries &&
       other._canonicalOverrides() == _canonicalOverrides();
 
   @override
@@ -638,6 +681,9 @@ class RfidTimingConfig {
         interReaderGapMs,
         postScanSettleMs,
         scanTimeoutSec,
+        writeVerifyRetries,
+        anticollRetries,
+        readerRetries,
         _canonicalOverrides(),
       );
 

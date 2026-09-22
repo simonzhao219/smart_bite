@@ -87,8 +87,9 @@ Module #X:
 - MISO: GPIO 9 (shared)
 - MOSI: GPIO 10 (shared)
 - SCK:  GPIO 11 (shared)
-- RST:  Unique per module
-- SS:   Unique per module
+- CE0:  GPIO 8 (shared, wired to the SDA/SS of all 7 modules)
+- RST:  Unique per module (22, 27, 17, 4, 23, 24, 25 for modules 1-7;
+        see `defaultReaderConfigs` in `lib/models/rfid_models.dart`)
 ```
 
 ### Dependencies
@@ -223,7 +224,7 @@ RFID_MODE=gpio flutter run
 - Raspberry Pi (any model with 40-pin GPIO)
 - 7× RC522 RFID modules (13.56 MHz)
 - Proper power supply (RC522 requires stable 3.3V)
-- Wiring harness for shared SPI + unique RST/SS
+- Wiring harness for shared SPI (incl. CE0) + one unique RST line per module
 
 ## 🔗 Related Documentation
 

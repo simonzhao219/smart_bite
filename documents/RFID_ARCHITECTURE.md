@@ -149,9 +149,8 @@ import 'package:smart_bite/adapters/gpio_spi_rfid_adapter.dart';
 final customConfigs = [
   RC522Config(
     deviceId: '01',
-    spiDevice: '/dev/spidev0.0',
-    rstPin: 17,
-    ssPin: 8,
+    spiNum: 0, // /dev/spidev0.0
+    rstPin: 22,
   ),
   // ... configure 6 more modules
 ];
@@ -240,22 +239,26 @@ testWidgets('Order page displays detected meals', (tester) async {
 
 ### Raspberry Pi GPIO Pins
 
-Default configuration for 7 RC522 modules:
+Default configuration for 7 RC522 modules (source of truth: `defaultReaderConfigs` in `lib/models/rfid_models.dart`):
 
-| Module | Device ID | RST Pin | SS Pin |
-|--------|-----------|---------|--------|
-| 1      | 01        | GPIO 17 | GPIO 8 |
-| 2      | 02        | GPIO 27 | GPIO 7 |
-| 3      | 03        | GPIO 22 | GPIO 25|
-| 4      | 04        | GPIO 23 | GPIO 24|
-| 5      | 05        | GPIO 18 | GPIO 12|
-| 6      | 06        | GPIO 15 | GPIO 16|
-| 7      | 07        | GPIO 14 | GPIO 20|
+| Module | Device ID | RST Pin |
+|--------|-----------|---------|
+| 1      | 01        | GPIO 22 |
+| 2      | 02        | GPIO 27 |
+| 3      | 03        | GPIO 17 |
+| 4      | 04        | GPIO 4  |
+| 5      | 05        | GPIO 23 |
+| 6      | 06        | GPIO 24 |
+| 7      | 07        | GPIO 25 |
 
-**Shared SPI Pins:**
+**Shared SPI Pins (`/dev/spidev0.0`):**
 - MISO: GPIO 9
 - MOSI: GPIO 10
 - SCK: GPIO 11
+- CE0 (SDA/SS of every module): GPIO 8
+
+All 7 modules share CE0. There is no per-module SS pin: the RST lines select
+which module is awake, and only one RST is driven high at a time.
 
 ### Enable SPI
 

@@ -99,7 +99,7 @@ Resolved critical stability issues through timeout protection, proper resource c
 - Best for: Integration, automated recovery
 
 ### GPIO Pins Managed
-- Pin 17, 27, 22, 23, 24, 25, 26 (RFID RST pins)
+- Pin 22, 27, 17, 4, 23, 24, 25 (RFID RST pins, from `defaultReaderConfigs` in `lib/models/rfid_models.dart`)
 - Configurable in scripts for custom setups
 
 ---

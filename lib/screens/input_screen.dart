@@ -78,6 +78,8 @@ class _InputScreenState extends State<InputScreen> {
                   ),
                 Page.mealPage => MealPage(
                     onGoBack: () {
+                      // 回到首頁：背景輪巡停止
+                      context.read<RFIDReaderProvider>().stopPolling();
                       setState(() {
                         _currentPage = Page.homePage;
                       });
@@ -147,6 +149,9 @@ class _InputScreenState extends State<InputScreen> {
                       final dataProvider = context.read<DataProvider>();
                       final printerName = dataProvider.printerName;
 
+                      // 分析與列印期間不輪巡，避免搶 CPU
+                      await context.read<RFIDReaderProvider>().stopPolling();
+                      if (!context.mounted) return;
                       setState(() {
                         _currentPage = Page.analyzingPage;
                       });
@@ -364,6 +369,7 @@ class OrderPage extends StatelessWidget {
             ),
             const SizedBox(width: 22),
             _SubmitButton(
+              // 背景輪巡本來就一直在讀；這顆按鈕是「清掉保留的卡片、立刻重讀一次」
               onPressed: context.watch<RFIDReaderProvider>().isScanning
                   ? null
                   : () async {
@@ -375,11 +381,12 @@ class OrderPage extends StatelessWidget {
             _SubmitButton(
               onPressed: context.watch<RFIDReaderProvider>().isScanning
                   ? null
-                  : () {
-                      // Transfer order data to DataProvider
-                      final orderNames =
-                          context.read<RFIDReaderProvider>().orderNames;
-                      context.read<DataProvider>().orderNames = orderNames;
+                  : () async {
+                      final provider = context.read<RFIDReaderProvider>();
+                      final dataProvider = context.read<DataProvider>();
+                      // 先停輪巡，orderNames 才不會在交接的瞬間又變
+                      await provider.stopPolling();
+                      dataProvider.orderNames = provider.orderNames;
                       onSubmit();
                     },
               label: '分析',
@@ -391,18 +398,15 @@ class OrderPage extends StatelessWidget {
   }
 
   Widget _buildMealDisplay(BuildContext context) {
-    final isScanning = context.select<RFIDReaderProvider, bool>(
-      (provider) => provider.isScanning,
-    );
-
-    if (isScanning) {
+    // 背景輪巡每輪都會 notify；顯示合併後的狀態，不用 spinner 切換 (會閃爍)。
+    // 只有按「重新感應」的單次掃描才顯示 spinner。
+    final provider = context.watch<RFIDReaderProvider>();
+    if (provider.isScanning) {
       return const CircularProgressIndicator.adaptive();
     }
 
     // Get all readers and their readings
-    final readers = context.select<RFIDReaderProvider, List<RFIDReader>>(
-      (provider) => provider.readers,
-    );
+    final readers = provider.readers;
 
     if (readers.isEmpty) {
       return const _OrderCard(
@@ -421,9 +425,8 @@ class OrderPage extends StatelessWidget {
       final reader = entry.value;
       final readerNum = index + 1;
 
-      // Get the reading for this reader
-      final reading =
-          context.read<RFIDReaderProvider>().getReading(reader.deviceId);
+      // Get the (merged) reading for this reader
+      final reading = provider.getReading(reader.deviceId);
 
       // Only show readers that have cards
       if (reading?.hasCard == true) {
@@ -456,26 +459,31 @@ class OrderPage extends StatelessWidget {
             children: cardsWithMeals,
           );
 
-    // 線路異常的讀卡機要明確提示，不能讓使用者以為只是沒放餐盤
-    final errorIds = context.read<RFIDReaderProvider>().errorReaderIds;
+    // 線路異常 (背景輪巡時要連續幾輪都異常才算) 要明確提示，
+    // 不能讓客人以為只是沒放餐盤；文字是對客人說的，字級跟頁面其他文字一致
+    final errorIds = provider.errorReaderIds;
     if (errorIds.isEmpty) return content;
 
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         content,
-        const SizedBox(height: 8),
+        const SizedBox(height: 16),
         Text(
-          '讀卡機 ${errorIds.join('、')} 線路異常，請檢查接線後按「重新感應」',
-          style: TextStyle(
-            color: Colors.red[700],
-            fontSize: 14,
-            fontWeight: FontWeight.w600,
-          ),
+          '第 ${errorIds.map(_readerNumber).join('、')} 號感應區暫時無法使用，請叫服務人員',
+          style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                color: Colors.red[700],
+                fontWeight: FontWeight.w600,
+              ),
+          textAlign: TextAlign.center,
         ),
       ],
     );
   }
+
+  /// "07" → "7"
+  static String _readerNumber(String deviceId) =>
+      (int.tryParse(deviceId) ?? deviceId).toString();
 }
 
 class ConfirmPage extends StatelessWidget {
@@ -821,7 +829,7 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final isScanning = context.select<RFIDReaderProvider, bool>(
-      (provider) => provider.isScanning,
+      (provider) => provider.isScanning || provider.isCalibrating,
     );
 
     return Column(
@@ -866,10 +874,13 @@ class _HomePageState extends State<HomePage> {
                     return;
                   }
 
-                  // Printer found, proceed with RFID reader initialization
+                  // Printer found: start background polling and wait for the
+                  // first round (bounded) instead of a fixed 3 seconds
                   // ignore: use_build_context_synchronously
-                  context.read<RFIDReaderProvider>().updateReaders();
-                  await Future.delayed(const Duration(seconds: 3));
+                  final provider = context.read<RFIDReaderProvider>();
+                  provider.startPolling();
+                  await provider.waitForFirstRound();
+                  if (!mounted) return;
                   widget.onSubmit();
                 },
           label: '開始',

@@ -16,8 +16,13 @@
 ///    但同一輪掃描裡七顆各測各的，所以每顆各自搜尋不需要七倍時間。
 ///    每個候選值跑 N 輪，全中才往下一個更小的值走；取最小可過的值之後再往上
 ///    加 [RfidOptimizerOptions.marginSteps] 階當安全餘裕 (不超過起點)。
-/// 4. 驗證階段：用最終值跑 M 輪，任何一顆漏讀就把它的四個參數各放寬一階重驗；
+/// 4. 驗證階段：用最終值跑 M 輪，任何一顆漏讀就把它的參數各放寬一階重驗；
 ///    重驗仍失敗的讀卡機退回原設定並標記。
+///
+/// `reqaAttempts` 預設不掃 ([RfidOptimizerOptions.sweepReqaAttempts])：它只在沒卡時
+/// 花時間，有卡時 REQA 第一次通常就中，把它砍到 1 只省空讀卡機的時間，卻少一次重試的
+/// 保險，而 N 輪全中的統計抓不到幾 % 的漏讀率。預設 N = 8、M = 60 也是同一個理由：
+/// 5 輪全中在真實漏讀率 20% 時仍有 33% 的機率通過。
 ///
 /// 量測時 (確認、掃描、驗證) 每顆都額外覆寫 `linkCheckTimeoutMs: 0`、`readerRetries: 0`
 /// ([RfidOptimizer.measuringOverrides])，太小的候選值才不會被連線檢查的保險等待或
@@ -176,6 +181,9 @@ class RfidOptimizerOptions {
   /// 跳過連線階段 (時脈維持目前設定)
   final bool skipLinkStage;
 
+  /// 是否也掃 `reqaAttempts` (預設不掃，維持起點值；理由見檔頭)
+  final bool sweepReqaAttempts;
+
   const RfidOptimizerOptions({
     this.spiSpeeds = const [1000000, 500000, 250000],
     this.linkSamples = 200,
@@ -187,11 +195,12 @@ class RfidOptimizerOptions {
     this.antennaEscalation = const [50, 100, 200],
     this.reqaTimeoutEscalation = const [50, 100],
     this.reqaAttemptEscalation = const [3, 4],
-    this.sweepRounds = 5,
-    this.verifyRounds = 20,
+    this.sweepRounds = 8,
+    this.verifyRounds = 60,
     this.marginSteps = 1,
-    this.maxVerifyRetries = 2,
+    this.maxVerifyRetries = 3,
     this.skipLinkStage = false,
+    this.sweepReqaAttempts = false,
   });
 
   static const RfidOptimizerOptions defaults = RfidOptimizerOptions();
@@ -235,6 +244,12 @@ class RfidOptimizerOptions {
     }
   }
 
+  /// 實際參與搜尋 (確認階段放寬、掃描、驗證放寬) 的參數，依 [sweepOrder] 排序
+  List<String> get activeParameters => [
+        for (final parameter in sweepOrder)
+          if (parameter != 'reqaAttempts' || sweepReqaAttempts) parameter,
+      ];
+
   /// 確認階段最多放寬幾次 (升階清單最長的那個)
   int get maxEscalationSteps {
     var steps = 0;
@@ -261,6 +276,7 @@ class RfidOptimizerOptions {
     int? marginSteps,
     int? maxVerifyRetries,
     bool? skipLinkStage,
+    bool? sweepReqaAttempts,
   }) {
     return RfidOptimizerOptions(
       spiSpeeds: spiSpeeds ?? this.spiSpeeds,
@@ -282,6 +298,7 @@ class RfidOptimizerOptions {
       marginSteps: marginSteps ?? this.marginSteps,
       maxVerifyRetries: maxVerifyRetries ?? this.maxVerifyRetries,
       skipLinkStage: skipLinkStage ?? this.skipLinkStage,
+      sweepReqaAttempts: sweepReqaAttempts ?? this.sweepReqaAttempts,
     );
   }
 
@@ -320,6 +337,7 @@ class RfidOptimizerOptions {
       marginSteps: marginSteps < 0 ? 0 : marginSteps,
       maxVerifyRetries: maxVerifyRetries < 0 ? 0 : maxVerifyRetries,
       skipLinkStage: skipLinkStage,
+      sweepReqaAttempts: sweepReqaAttempts,
     );
   }
 
@@ -327,7 +345,7 @@ class RfidOptimizerOptions {
   /// 進度估算與對話框的時間預估用，實際跑完確認階段後會依每顆的起點重算)
   int get maxSweepRounds {
     var steps = 0;
-    for (final parameter in sweepOrder) {
+    for (final parameter in activeParameters) {
       steps += candidatesOf(parameter).length - 1;
     }
     return steps * sweepRounds;
@@ -349,6 +367,7 @@ class RfidOptimizerOptions {
         'marginSteps': marginSteps,
         'maxVerifyRetries': maxVerifyRetries,
         'skipLinkStage': skipLinkStage,
+        'sweepReqaAttempts': sweepReqaAttempts,
       };
 
   factory RfidOptimizerOptions.fromJson(Map<String, dynamic> json) {
@@ -382,6 +401,7 @@ class RfidOptimizerOptions {
       marginSteps: integer('marginSteps', d.marginSteps),
       maxVerifyRetries: integer('maxVerifyRetries', d.maxVerifyRetries),
       skipLinkStage: json['skipLinkStage'] == true,
+      sweepReqaAttempts: json['sweepReqaAttempts'] == true,
     );
   }
 }
@@ -712,12 +732,28 @@ class RfidOptimizer {
 
     OptimizationResult unchanged({required bool cancelledFlag, String? note}) {
       if (note != null) notes.add(note);
+      var readers =
+          summaries(values: const {}, verifyHits: const {}, verifyRounds: 0);
+      if (cancelledFlag) {
+        // 取消時沒有任何一顆驗證過，不能顯示成「穩定」
+        readers = {
+          for (final entry in readers.entries)
+            entry.key: ReaderOptimizationSummary(
+              deviceId: entry.value.deviceId,
+              values: entry.value.values,
+              verifyHits: 0,
+              verifyRounds: 0,
+              stable: false,
+              timeToReadyMs: entry.value.timeToReadyMs,
+              note: entry.value.note ?? '已取消',
+            ),
+        };
+      }
       return OptimizationResult(
         before: base,
         config: base,
         linkMeasurements: link,
-        readers:
-            summaries(values: const {}, verifyHits: const {}, verifyRounds: 0),
+        readers: readers,
         notes: notes,
         elapsedMs: stopwatch.elapsedMilliseconds,
         roundsRun: roundsRun,
@@ -769,8 +805,10 @@ class RfidOptimizer {
     }
 
     /// 某顆某個參數的候選值 (由大到小) 與搜尋起點的索引。
-    /// 起點 = max(目前生效的值, 一般候選值的最大值)；起點之上是升階值 (只在確認階段
-    /// 讀不到卡時用到)，起點之下是一般候選值。rstSettleMs 另外不低於就緒時間推出的下限。
+    /// 候選值 = 升階值 ∪ 一般候選值 ∪ {起點}，起點 = max(目前生效的值, 一般候選值的最大值)。
+    /// 起點之上的值只在確認階段讀不到卡時用到，起點之下的值 (不論來自哪個清單) 都是
+    /// 掃描階段往下走的階梯，所以起點 200 ms 時中間會經過 100、50 而不是直接跳到 20。
+    /// rstSettleMs 另外不低於就緒時間推出的下限。
     (List<int>, int) candidatesFor(String id, String parameter) {
       final normal = options.candidatesOf(parameter);
       final current = base.forReader(id).valueOf(parameter);
@@ -788,9 +826,9 @@ class RfidOptimizer {
       }
 
       final all = <int>{
-        ...options.escalationOf(parameter).where((v) => v > start),
+        ...options.escalationOf(parameter),
         start,
-        ...normal.where((v) => v < start),
+        ...normal,
       }.where((v) => v >= floor).toList()
         ..sort((a, b) => b.compareTo(a));
       if (all.isEmpty) return ([floor], 0);
@@ -910,11 +948,11 @@ class RfidOptimizer {
             pending.where((id) => hits[id]! < options.sweepRounds).toList();
         if (failing.isEmpty) break;
 
-        // 讀不到的讀卡機：四個參數各往上放寬一階再試；已經沒得放寬的標為不穩定
+        // 讀不到的讀卡機：參與搜尋的參數各往上放寬一階再試；已經沒得放寬的標為不穩定
         final escalated = <String>[];
         for (final id in failing) {
           var moved = false;
-          for (final parameter in RfidOptimizerOptions.sweepOrder) {
+          for (final parameter in options.activeParameters) {
             final index = startIndex[id]![parameter]!;
             if (index == 0) continue;
             startIndex[id]![parameter] = index - 1;
@@ -956,13 +994,13 @@ class RfidOptimizer {
       }
 
       overallTotal = overallDone + verifyUnits;
-      for (final parameter in RfidOptimizerOptions.sweepOrder) {
+      for (final parameter in options.activeParameters) {
         overallTotal += sweepBudget(parameter);
       }
 
       // ---- 3. 掃描階段 ----
       var budgetDone = overallDone;
-      for (final parameter in RfidOptimizerOptions.sweepOrder) {
+      for (final parameter in options.activeParameters) {
         final budget = sweepBudget(parameter);
         final index = <String, int>{
           for (final id in ids) id: startIndex[id]![parameter]!,
@@ -1052,7 +1090,7 @@ class RfidOptimizer {
         }
         retries++;
         for (final id in failing) {
-          _stepUp(id, values, candidates[id]!);
+          _stepUp(id, values, candidates[id]!, options.activeParameters);
           notes.add('讀卡機 $id 驗證漏讀 ${options.verifyRounds - verifyHits[id]!} 次，'
               '參數放寬一階後重驗');
         }
@@ -1085,13 +1123,14 @@ class RfidOptimizer {
     }
   }
 
-  /// 把某顆的四個參數各往上放寬一階 (候選值由大到小，往上就是索引減一)
+  /// 把某顆參與搜尋的參數各往上放寬一階 (候選值由大到小，往上就是索引減一)
   static void _stepUp(
     String id,
     Map<String, Map<String, int>> values,
     Map<String, List<int>> candidates,
+    List<String> parameters,
   ) {
-    for (final parameter in RfidOptimizerOptions.sweepOrder) {
+    for (final parameter in parameters) {
       final list = candidates[parameter]!;
       final current = values[id]![parameter]!;
       final position = list.indexOf(current);

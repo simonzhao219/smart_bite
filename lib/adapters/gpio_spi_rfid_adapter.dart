@@ -244,6 +244,7 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     debugPrint('Starting async scan of ${_configs.length} readers...');
     final stopwatch = Stopwatch()..start();
     _scanInFlight = true;
+    Future<Map<String, dynamic>>? job;
 
     try {
       final load = await _ensureTiming();
@@ -254,8 +255,18 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
         'timing': load.config.toJson(),
       };
 
-      // Perform scan on background isolate to avoid UI blocking
-      final raw = await compute(_performScanInIsolate, message);
+      // 掃描在 background isolate 跑；整輪逾時的判斷放在這一邊：
+      // worker 不會被中途丟下，掃完一定會關閉 GPIO / SPI。逾時後 _scanInFlight 會維持到
+      // worker 真的結束，期間的掃描與校正都被略過，GPIO 才不會一直 busy 到重啟。
+      final timeout = load.config.scanTimeoutFor(_configs.length);
+      job = compute(_performScanInIsolate, message);
+      final raw = await job.timeout(
+        timeout,
+        onTimeout: () => throw TimeoutException(
+          'RFID scan timeout after ${timeout.inSeconds} seconds',
+          timeout,
+        ),
+      );
       final cycle = ScanCycleResult.fromJson(raw);
       _lastScanDuration = stopwatch.elapsed;
       _lastCycleMs = cycle.totalMs;
@@ -296,7 +307,18 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
       notifyListeners();
       return errorReadings;
     } finally {
-      _scanInFlight = false;
+      final pending = job;
+      if (pending == null) {
+        _scanInFlight = false;
+      } else {
+        // 正常結束時這裡馬上清掉；逾時時等 worker 真的結束才清
+        unawaited(
+          pending.then<void>((_) {}, onError: (Object _) {}).whenComplete(() {
+            _scanInFlight = false;
+            notifyListeners();
+          }),
+        );
+      }
     }
   }
 
@@ -349,18 +371,9 @@ class GPIOSPIRFIDReaderManager extends ChangeNotifier
     );
 
     final pollingService = RFIDPollingService(timing: timing, log: debugPrint);
-    // 整輪逾時：設定值與最壞情況的兩倍取較大者，超過就視為硬體卡死
-    final timeout = timing.scanTimeoutFor(configs.length);
+    // 逾時由主 isolate 判斷 (見 scanAll)，這裡一定把整輪跑完並關閉 session
     try {
-      final result = await pollingService.performOneLoopCycles(configs).timeout(
-        timeout,
-        onTimeout: () {
-          debugPrint('⚠️  RFID scan timeout in isolate');
-          throw TimeoutException(
-            'RFID scan timeout after ${timeout.inSeconds} seconds',
-          );
-        },
-      );
+      final result = await pollingService.performOneLoopCycles(configs);
       return result.toJson();
     } catch (e) {
       debugPrint('❌ Error in isolate scan: $e');

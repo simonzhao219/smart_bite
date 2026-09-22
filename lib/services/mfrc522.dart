@@ -5,7 +5,7 @@
 ///
 /// 跟舊版最大的差別：
 /// - 等待 IRQ 的迴圈改用「牆鐘時間」當上限，而不是固定讀 2000 次暫存器。
-///   線路不好時舊版會把 2000 次讀完 (每次都是一個 SPI ioctl，一次約 0.1 到 0.2 秒)，
+///   線路不好時舊版會把 2000 次讀完 (每次都是一個 SPI ioctl，2000 次合計約 0.1 到 0.2 秒)，
 ///   掃描時間因此隨線長浮動。
 /// - 關鍵暫存器寫入後會讀回驗證，不符就重寫 ([writeRegisterVerified])。
 ///   長線造成的偶發位元錯誤因此只會多花幾十微秒，而不是讓整顆讀卡機這一輪讀不到。
@@ -248,7 +248,6 @@ class MFRC522 {
     int command,
     List<int> sendData, {
     int bitFraming = 0x00,
-    int? deadlineMs,
   }) {
     var irqEn = 0x00;
     var waitIRq = 0x00;
@@ -299,7 +298,7 @@ class MFRC522 {
 
     // 等 IRQ：成功旗標、ErrIRq 或 TimerIRq 任一舉起就離開；
     // 期限到了之後再讀最後一次，系統卡頓時才不會把已經完成的結果當成無回應。
-    final deadline = deadlineMs ?? commDeadlineMs;
+    final deadline = commDeadlineMs;
     final stopwatch = Stopwatch()..start();
     var completed = false;
     var errorFired = false;

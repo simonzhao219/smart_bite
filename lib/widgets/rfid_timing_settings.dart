@@ -7,7 +7,6 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../provider/rfid_reader_provider.dart';
 import '../services/rfid_calibration.dart';
@@ -54,89 +53,109 @@ class RfidTimingSettingsCard extends StatelessWidget {
       estimate = '上次掃描耗時 $scanMs ms';
     }
 
+    // 預設收合：1280×720 時左欄還有平台資訊與讀卡機列表，展開才佔空間
+    final diagnostics = provider.diagnostics;
     return Card(
       elevation: 2,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+      child: ExpansionTile(
+        leading: const Icon(Icons.timer_outlined),
+        title: Row(
           children: [
-            Row(
-              children: [
-                const Icon(Icons.timer_outlined),
-                const SizedBox(width: 8),
-                Text(
-                  '輪巡時序設定',
-                  style: textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.bold),
-                ),
-                const Spacer(),
-                if (provider.isCalibrating) ...[
-                  const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  const SizedBox(width: 8),
-                  Text('校正中', style: textTheme.bodySmall),
-                ],
-              ],
+            Text(
+              '輪巡時序設定',
+              style:
+                  textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
             ),
+            const Spacer(),
+            if (provider.isCalibrating) ...[
+              const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 8),
+              Text('校正中', style: textTheme.bodySmall),
+            ],
+          ],
+        ),
+        subtitle: Text(
+          summary,
+          style: textTheme.bodySmall,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        expandedCrossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (estimate != null)
+            Text(
+              estimate,
+              style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
+            ),
+          if (load != null)
+            Text(
+              load.sourceDescription,
+              // 設定檔壞掉時 app 會靜默退回預設值，用醒目顏色提醒操作者
+              style: textTheme.bodySmall?.copyWith(
+                color: load.error != null ? Colors.red : Colors.grey[600],
+                fontWeight: load.error != null ? FontWeight.w600 : null,
+              ),
+              maxLines: load.error != null ? 4 : 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: supported && !busy
+                    ? () => showTimingEditDialog(context, provider)
+                    : null,
+                icon: const Icon(Icons.edit, size: 18),
+                label: const Text('編輯設定'),
+              ),
+              OutlinedButton.icon(
+                onPressed: supported && !busy
+                    ? () => showLinkCheckDialog(context, provider)
+                    : null,
+                icon: const Icon(Icons.cable, size: 18),
+                label: const Text('連線檢測'),
+              ),
+              FilledButton.icon(
+                onPressed: supported && !busy
+                    ? () => showOptimizeDialog(context, provider)
+                    : null,
+                icon: const Icon(Icons.auto_fix_high, size: 18),
+                label: const Text('自動最佳化'),
+              ),
+              TextButton.icon(
+                onPressed:
+                    supported && !busy ? () => provider.reloadSettings() : null,
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('重新載入設定檔'),
+              ),
+            ],
+          ),
+          if (diagnostics.isNotEmpty) ...[
             const SizedBox(height: 8),
-            Text(summary, style: textTheme.bodySmall),
-            if (estimate != null)
-              Text(
-                estimate,
-                style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
-              ),
-            if (load != null)
-              Text(
-                load.sourceDescription,
-                // 設定檔壞掉時 app 會靜默退回預設值，用醒目顏色提醒操作者
-                style: textTheme.bodySmall?.copyWith(
-                  color: load.error != null ? Colors.red : Colors.grey[600],
-                  fontWeight: load.error != null ? FontWeight.w600 : null,
-                ),
-                maxLines: load.error != null ? 4 : 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
+            // 工程師用的細節 (設定來源、每個欄位、每顆的摘要) 收在這裡
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              title: Text('詳細診斷', style: textTheme.bodySmall),
+              childrenPadding: const EdgeInsets.only(bottom: 8),
+              expandedCrossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                OutlinedButton.icon(
-                  onPressed: supported && !busy
-                      ? () => showTimingEditDialog(context, provider)
-                      : null,
-                  icon: const Icon(Icons.edit, size: 18),
-                  label: const Text('編輯設定'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: supported && !busy
-                      ? () => showLinkCheckDialog(context, provider)
-                      : null,
-                  icon: const Icon(Icons.cable, size: 18),
-                  label: const Text('連線檢測'),
-                ),
-                FilledButton.icon(
-                  onPressed: supported && !busy
-                      ? () => showOptimizeDialog(context, provider)
-                      : null,
-                  icon: const Icon(Icons.auto_fix_high, size: 18),
-                  label: const Text('自動最佳化'),
-                ),
-                TextButton.icon(
-                  onPressed: supported && !busy
-                      ? () => provider.reloadSettings()
-                      : null,
-                  icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('重新載入設定檔'),
-                ),
+                for (final entry in diagnostics.entries)
+                  Text(
+                    '${entry.key}: ${entry.value}',
+                    style:
+                        textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
+                  ),
               ],
             ),
           ],
-        ),
+        ],
       ),
     );
   }
@@ -182,8 +201,25 @@ class _TimingEditDialog extends StatefulWidget {
 class _TimingEditDialogState extends State<_TimingEditDialog> {
   static const List<int> _speedChoices = [1000000, 500000, 250000, 125000];
 
-  final _formKey = GlobalKey<FormState>();
-  late final Map<String, TextEditingController> _controllers;
+  /// 每個欄位的加減步距 (觸控 kiosk 沒有鍵盤，用按鈕調)
+  static const Map<String, int> _steps = {
+    'rstSettleMs': 5,
+    'linkCheckTimeoutMs': 10,
+    'antennaSettleMs': 5,
+    'reqaTimeoutMs': 5,
+    'reqaAttempts': 1,
+    'commDeadlineMs': 5,
+    'interReaderGapMs': 5,
+    'postScanSettleMs': 50,
+    'scanTimeoutSec': 1,
+    'writeVerifyRetries': 1,
+    'anticollRetries': 1,
+    'readerRetries': 1,
+    'pollGapMs': 50,
+    'stickyRounds': 1,
+  };
+
+  late Map<String, int> _values;
   late int _spiSpeedHz;
   late Map<String, Map<String, int>> _overrides;
   bool _saving = false;
@@ -193,10 +229,9 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
   void initState() {
     super.initState();
     final json = widget.initial.toBaseJson();
-    _controllers = {
+    _values = {
       for (final key in RfidTimingConfig.keys)
-        if (key != 'spiSpeedHz')
-          key: TextEditingController(text: json[key].toString()),
+        if (key != 'spiSpeedHz') key: json[key]!,
     };
     _spiSpeedHz = widget.initial.spiSpeedHz;
     _overrides = {
@@ -205,19 +240,11 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
     };
   }
 
-  @override
-  void dispose() {
-    for (final controller in _controllers.values) {
-      controller.dispose();
-    }
-    super.dispose();
-  }
-
   void _resetToDefaults() {
     final json = RfidTimingConfig.defaults.toBaseJson();
     setState(() {
-      for (final entry in _controllers.entries) {
-        entry.value.text = json[entry.key].toString();
+      for (final key in _values.keys.toList()) {
+        _values[key] = json[key]!;
       }
       _spiSpeedHz = RfidTimingConfig.defaults.spiSpeedHz;
       _overrides = {};
@@ -226,16 +253,12 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
   }
 
   RfidTimingConfig _buildConfig() {
-    final json = <String, dynamic>{'spiSpeedHz': _spiSpeedHz};
-    for (final entry in _controllers.entries) {
-      json[entry.key] = int.parse(entry.value.text.trim());
-    }
+    final json = <String, dynamic>{'spiSpeedHz': _spiSpeedHz, ..._values};
     json[RfidTimingConfig.readersKey] = _overrides;
     return RfidTimingConfig.fromJson(json).validated();
   }
 
   Future<void> _save() async {
-    if (!(_formKey.currentState?.validate() ?? false)) return;
     setState(() {
       _saving = true;
       _error = null;
@@ -249,14 +272,6 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
         _error = '儲存失敗: $e';
       });
     }
-  }
-
-  String? _validate(String key, String? value) {
-    final parsed = int.tryParse((value ?? '').trim());
-    if (parsed == null) return '請輸入整數';
-    final (low, high) = RfidTimingConfig.ranges[key]!;
-    if (parsed < low || parsed > high) return '範圍 $low 到 $high';
-    return null;
   }
 
   @override
@@ -274,129 +289,122 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
       title: const Text('編輯輪巡時序設定'),
       content: SizedBox(
         width: 760,
-        child: Form(
-          key: _formKey,
-          child: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '這些是全域值；有個別覆寫的讀卡機會以覆寫值為準。'
-                  '不確定的話按「自動最佳化」讓程式量出來。',
-                  style: textTheme.bodySmall?.copyWith(color: Colors.grey[700]),
-                ),
-                const SizedBox(height: 12),
-                Wrap(
-                  spacing: 16,
-                  runSpacing: 12,
-                  children: [
-                    SizedBox(
-                      width: 350,
-                      child: DropdownButtonFormField<int>(
-                        initialValue: _spiSpeedHz,
-                        decoration: InputDecoration(
-                          labelText: RfidTimingConfig.labels['spiSpeedHz'],
-                          helperText: RfidTimingConfig.hints['spiSpeedHz'],
-                          helperMaxLines: 2,
-                          border: const OutlineInputBorder(),
-                        ),
-                        items: [
-                          for (final speed in speedItems)
-                            DropdownMenuItem(
-                              value: speed,
-                              child: Text('$speed Hz'),
-                            ),
-                        ],
-                        onChanged: (value) {
-                          if (value != null) {
-                            setState(() => _spiSpeedHz = value);
-                          }
-                        },
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '這些是全域值；有個別覆寫的讀卡機會以覆寫值為準。'
+                '不確定的話按「自動最佳化」讓程式量出來。長按加減可以連續調。',
+                style: textTheme.bodySmall?.copyWith(color: Colors.grey[700]),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 16,
+                runSpacing: 12,
+                children: [
+                  SizedBox(
+                    width: 350,
+                    child: DropdownButtonFormField<int>(
+                      initialValue: _spiSpeedHz,
+                      decoration: InputDecoration(
+                        labelText: RfidTimingConfig.labels['spiSpeedHz'],
+                        helperText: RfidTimingConfig.hints['spiSpeedHz'],
+                        helperMaxLines: 2,
+                        border: const OutlineInputBorder(),
                       ),
-                    ),
-                    for (final entry in _controllers.entries)
-                      SizedBox(
-                        width: 350,
-                        child: TextFormField(
-                          controller: entry.value,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [
-                            FilteringTextInputFormatter.digitsOnly,
-                          ],
-                          decoration: InputDecoration(
-                            labelText: RfidTimingConfig.labels[entry.key],
-                            helperText: RfidTimingConfig.hints[entry.key],
-                            helperMaxLines: 2,
-                            border: const OutlineInputBorder(),
+                      items: [
+                        for (final speed in speedItems)
+                          DropdownMenuItem(
+                            value: speed,
+                            child: Text('$speed Hz'),
                           ),
-                          validator: (value) => _validate(entry.key, value),
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Text(
-                      '各讀卡機的個別覆寫',
-                      style: textTheme.titleSmall
-                          ?.copyWith(fontWeight: FontWeight.bold),
-                    ),
-                    const Spacer(),
-                    if (overriddenIds.isNotEmpty)
-                      TextButton.icon(
-                        onPressed: () => setState(() => _overrides = {}),
-                        icon: const Icon(Icons.clear_all, size: 18),
-                        label: const Text('清除全部覆寫'),
-                      ),
-                  ],
-                ),
-                if (overriddenIds.isEmpty)
-                  Text(
-                    '目前沒有覆寫，所有讀卡機都用上面的全域值。'
-                    '自動最佳化會替每顆各自寫入覆寫值。',
-                    style:
-                        textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
-                  )
-                else
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      columnSpacing: 16,
-                      headingRowHeight: 36,
-                      dataRowMinHeight: 32,
-                      dataRowMaxHeight: 40,
-                      columns: [
-                        const DataColumn(label: Text('讀卡機')),
-                        for (final key in RfidTimingConfig.perReaderKeys)
-                          DataColumn(label: Text(_shortLabel(key))),
-                        const DataColumn(label: Text('')),
                       ],
-                      rows: [
-                        for (final id in overriddenIds)
-                          DataRow(cells: [
-                            DataCell(Text(id)),
-                            for (final key in RfidTimingConfig.perReaderKeys)
-                              DataCell(Text(
-                                _overrides[id]![key]?.toString() ?? '-',
-                              )),
-                            DataCell(IconButton(
-                              tooltip: '清除這顆的覆寫',
-                              icon: const Icon(Icons.close, size: 18),
-                              onPressed: () =>
-                                  setState(() => _overrides.remove(id)),
-                            )),
-                          ]),
-                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() => _spiSpeedHz = value);
+                        }
+                      },
                     ),
                   ),
-                if (_error != null) ...[
-                  const SizedBox(height: 12),
-                  Text(_error!, style: const TextStyle(color: Colors.red)),
+                  for (final key in _values.keys)
+                    SizedBox(
+                      width: 350,
+                      child: _IntStepper(
+                        label: RfidTimingConfig.labels[key] ?? key,
+                        hint: RfidTimingConfig.hints[key],
+                        value: _values[key]!,
+                        min: RfidTimingConfig.ranges[key]!.$1,
+                        max: RfidTimingConfig.ranges[key]!.$2,
+                        step: _steps[key] ?? 1,
+                        enabled: !_saving,
+                        onChanged: (value) =>
+                            setState(() => _values[key] = value),
+                      ),
+                    ),
                 ],
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Text(
+                    '各讀卡機的個別覆寫',
+                    style: textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.bold),
+                  ),
+                  const Spacer(),
+                  if (overriddenIds.isNotEmpty)
+                    TextButton.icon(
+                      onPressed: () => setState(() => _overrides = {}),
+                      icon: const Icon(Icons.clear_all, size: 18),
+                      label: const Text('清除全部覆寫'),
+                    ),
+                ],
+              ),
+              if (overriddenIds.isEmpty)
+                Text(
+                  '目前沒有覆寫，所有讀卡機都用上面的全域值。'
+                  '自動最佳化會替每顆各自寫入覆寫值。',
+                  style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
+                )
+              else
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: DataTable(
+                    columnSpacing: 16,
+                    headingRowHeight: 36,
+                    dataRowMinHeight: 32,
+                    dataRowMaxHeight: 40,
+                    columns: [
+                      const DataColumn(label: Text('讀卡機')),
+                      for (final key in RfidTimingConfig.perReaderKeys)
+                        DataColumn(label: Text(_shortLabel(key))),
+                      const DataColumn(label: Text('')),
+                    ],
+                    rows: [
+                      for (final id in overriddenIds)
+                        DataRow(cells: [
+                          DataCell(Text(id)),
+                          for (final key in RfidTimingConfig.perReaderKeys)
+                            DataCell(Text(
+                              _overrides[id]![key]?.toString() ?? '-',
+                            )),
+                          DataCell(IconButton(
+                            tooltip: '清除這顆的覆寫',
+                            icon: const Icon(Icons.close, size: 18),
+                            onPressed: () =>
+                                setState(() => _overrides.remove(id)),
+                          )),
+                        ]),
+                    ],
+                  ),
+                ),
+              if (_error != null) ...[
+                const SizedBox(height: 12),
+                Text(_error!, style: const TextStyle(color: Colors.red)),
               ],
-            ),
+            ],
           ),
         ),
       ),
@@ -414,6 +422,109 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
           child: Text(_saving ? '儲存中…' : '儲存'),
         ),
       ],
+    );
+  }
+}
+
+/// 「− 值 +」的整數步進欄位：觸控 kiosk 沒有螢幕鍵盤時仍能調整。
+/// 長按會連續加減，按住越久步距越大。
+class _IntStepper extends StatefulWidget {
+  final String label;
+  final String? hint;
+  final int value;
+  final int min;
+  final int max;
+  final int step;
+  final bool enabled;
+  final ValueChanged<int> onChanged;
+
+  const _IntStepper({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.step,
+    required this.onChanged,
+    this.hint,
+    this.enabled = true,
+  });
+
+  @override
+  State<_IntStepper> createState() => _IntStepperState();
+}
+
+class _IntStepperState extends State<_IntStepper> {
+  Timer? _repeat;
+  int _repeats = 0;
+
+  @override
+  void dispose() {
+    _repeat?.cancel();
+    super.dispose();
+  }
+
+  void _nudge(int direction) {
+    // 按住超過 15 下之後步距放大 5 倍，從 5 調到 500 不用等太久
+    final multiplier = _repeats >= 15 ? 5 : 1;
+    final next = (widget.value + direction * widget.step * multiplier)
+        .clamp(widget.min, widget.max);
+    if (next != widget.value) widget.onChanged(next);
+  }
+
+  void _startRepeat(int direction) {
+    _repeats = 0;
+    _repeat?.cancel();
+    _repeat = Timer.periodic(const Duration(milliseconds: 120), (_) {
+      _repeats++;
+      _nudge(direction);
+    });
+  }
+
+  void _stopRepeat() {
+    _repeat?.cancel();
+    _repeat = null;
+    _repeats = 0;
+  }
+
+  Widget _button(IconData icon, int direction, bool enabled) {
+    return GestureDetector(
+      onLongPressStart: enabled ? (_) => _startRepeat(direction) : null,
+      onLongPressEnd: enabled ? (_) => _stopRepeat() : null,
+      onLongPressCancel: enabled ? _stopRepeat : null,
+      child: IconButton(
+        icon: Icon(icon),
+        onPressed: enabled ? () => _nudge(direction) : null,
+        visualDensity: VisualDensity.compact,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final canDecrease = widget.enabled && widget.value > widget.min;
+    final canIncrease = widget.enabled && widget.value < widget.max;
+    return InputDecorator(
+      decoration: InputDecoration(
+        labelText: widget.label,
+        helperText: widget.hint,
+        helperMaxLines: 2,
+        border: const OutlineInputBorder(),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      ),
+      child: Row(
+        children: [
+          _button(Icons.remove, -1, canDecrease),
+          Expanded(
+            child: Text(
+              '${widget.value}',
+              textAlign: TextAlign.center,
+              style: textTheme.titleMedium,
+            ),
+          ),
+          _button(Icons.add, 1, canIncrease),
+        ],
+      ),
     );
   }
 }
@@ -705,6 +816,7 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
   int _verifyRounds = RfidOptimizerOptions.defaults.verifyRounds;
   int _marginSteps = RfidOptimizerOptions.defaults.marginSteps;
   bool _skipLink = false;
+  bool _sweepAttempts = RfidOptimizerOptions.defaults.sweepReqaAttempts;
 
   OptimizerProgress? _progress;
   OptimizationResult? _result;
@@ -717,15 +829,24 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
         verifyRounds: _verifyRounds,
         marginSteps: _marginSteps,
         skipLinkStage: _skipLink,
+        sweepReqaAttempts: _sweepAttempts,
       );
 
+  /// 粗估：確認階段用目前設定「七顆都有卡」的一輪時間，掃描與驗證階段的值越來越小，
+  /// 用一半算；不含往上放寬的情況
   int get _estimatedSeconds {
     final options = _options.validated();
-    final rounds =
-        options.sweepRounds + options.maxSweepRounds + options.verifyRounds;
+    final ids = widget.provider.readers.map((r) => r.deviceId).toList();
+    final config = widget.provider.timing;
+    final perRoundMs = ids.isEmpty
+        ? config.estimateAllCardsScanMsFor(const ['01'])
+        : config.estimateAllCardsScanMsFor(ids);
+    final sanityMs = options.sweepRounds * perRoundMs;
+    final sweepMs = options.maxSweepRounds * perRoundMs / 2;
+    final verifyMs = options.verifyRounds * perRoundMs / 2;
     final linkSeconds =
         options.skipLinkStage ? 0 : options.spiSpeeds.length * 2;
-    return (rounds * 0.3 + linkSeconds).round();
+    return ((sanityMs + sweepMs + verifyMs) / 1000 + linkSeconds).round();
   }
 
   Future<void> _start() async {
@@ -831,8 +952,8 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
               const SizedBox(height: 8),
               Text(
                 '程式會先量每顆的連線品質與就緒時間，接著把 RST 等待、天線等待、'
-                'REQA 逾時與次數由大往小試，每顆讀卡機各自找出最小可靠值，'
-                '再加一階安全餘裕並驗證。過程中請不要移動卡片。',
+                'REQA 逾時從目前值往小試 (讀不到時會先往上放寬)，每顆讀卡機各自找出'
+                '最小可靠值，再加一階安全餘裕並驗證。過程中請不要移動卡片。',
                 style: textTheme.bodySmall,
               ),
               const SizedBox(height: 16),
@@ -844,13 +965,13 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
                   _choice<int>(
                     label: '每個候選值跑幾輪',
                     value: _sweepRounds,
-                    choices: const [3, 5, 10],
+                    choices: const [5, 8, 12],
                     onChanged: (v) => setState(() => _sweepRounds = v),
                   ),
                   _choice<int>(
                     label: '最後驗證幾輪',
                     value: _verifyRounds,
-                    choices: const [10, 20, 50],
+                    choices: const [30, 60, 100],
                     onChanged: (v) => setState(() => _verifyRounds = v),
                   ),
                   _choice<int>(
@@ -869,11 +990,23 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
                       title: const Text('跳過連線檢測，維持目前 SPI 時脈'),
                     ),
                   ),
+                  SizedBox(
+                    width: 280,
+                    child: CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      value: _sweepAttempts,
+                      onChanged: (v) =>
+                          setState(() => _sweepAttempts = v ?? false),
+                      title: const Text('也把 REQA 次數往下試'),
+                      subtitle: const Text('只省沒卡時的時間，少一次重試的保險'),
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 8),
               Text(
-                '預計約 $_estimatedSeconds 秒。',
+                '預計約 $_estimatedSeconds 秒 (有讀卡機需要放寬時會更久)。',
                 style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
               ),
             ],

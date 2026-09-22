@@ -80,9 +80,6 @@ class RfidScanSession {
   final Map<int, SPI> _buses = {};
   final List<GpioResetLine> _lines = [];
   final List<SimpleMFRC522> _readers = [];
-
-  /// 開啟時就失敗的讀卡機 (例如 GPIO busy)，每輪都會直接回報這個錯誤
-  final Map<String, ReaderScanResult> _openErrors = {};
   bool _isOpen = false;
 
   RfidScanSession(
@@ -96,6 +93,10 @@ class RfidScanSession {
   List<String> get deviceIds => configs.map((c) => c.deviceId).toList();
 
   /// 開啟所有 RST (全部拉低) 與 SPI bus。已開啟時不做事。
+  ///
+  /// 任何一支 RST 打不開 (GPIO busy、權限) 就整輪失敗並指名腳位：那顆的 RST 沒被
+  /// 拉低時可能是高的 (GPIO4 開機預設上拉)，晶片醒著搶 MISO，其他六顆全都會讀不到，
+  /// 繼續掃只會回報六條線「線路異常」，錯的方向。
   void open() {
     if (_isOpen) return;
     try {
@@ -106,12 +107,11 @@ class RfidScanSession {
           line.open();
         } catch (e) {
           _log('${config.deviceId}: 無法開啟 RST GPIO${config.rstPin}: $e');
-          _openErrors[config.deviceId] = ReaderScanResult(
-            deviceId: config.deviceId,
-            status: ReaderScanStatus.error,
-            error: 'GPIO${config.rstPin}: $e',
+          throw StateError(
+            '讀卡機 ${config.deviceId} 的 RST GPIO${config.rstPin} 打不開 ($e)。'
+            '這支腳沒拉低時其他讀卡機也讀不到，整輪掃描中止；'
+            '請關閉其他使用 GPIO 的程式或執行 scripts/gpio_cleanup.sh',
           );
-          continue;
         }
         _lines.add(line);
 
@@ -138,15 +138,17 @@ class RfidScanSession {
     if (!_isOpen) open();
     final effective = (timing ?? this.timing).validated();
     final stopwatch = Stopwatch()..start();
-    final results = <String, ReaderScanResult>{..._openErrors};
+    final results = <String, ReaderScanResult>{};
 
-    for (final reader in _readers) {
+    for (var i = 0; i < _readers.length; i++) {
+      final reader = _readers[i];
       final result = await reader.scanOnce(
         timing: effective.forReader(reader.deviceId),
       );
       results[reader.deviceId] = result;
       _log('${reader.deviceId}: ${result.summary}');
-      if (effective.interReaderGapMs > 0) {
+      // 顆間間隔只在兩顆之間，最後一顆之後不等
+      if (effective.interReaderGapMs > 0 && i < _readers.length - 1) {
         await Future<void>.delayed(
           Duration(milliseconds: effective.interReaderGapMs),
         );
@@ -206,7 +208,6 @@ class RfidScanSession {
       }
     }
     _buses.clear();
-    _openErrors.clear();
     _isOpen = false;
   }
 

@@ -97,7 +97,6 @@ class MFRC522Status {
 
   /// 晶片 timer 逾時：晶片有正常回應，但場內沒有卡片
   static const int notag = 2;
-  static const int collision = 3;
 
   /// 軟體牆鐘逾時：晶片在期限內連 timer IRQ 都沒舉起，
   /// 通常是 SPI 線路或供電問題，而不是「沒有卡」
@@ -114,8 +113,6 @@ class MFRC522Status {
         return 'error';
       case notag:
         return 'no_tag';
-      case collision:
-        return 'collision';
       case timeout:
         return 'comm_timeout';
       case spiError:

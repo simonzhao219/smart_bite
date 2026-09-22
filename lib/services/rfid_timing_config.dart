@@ -44,6 +44,9 @@ class RfidTimingLoadResult {
   /// 被環境變數覆寫的欄位名稱
   final List<String> envOverrides;
 
+  /// 有設定但值不是整數、被忽略的環境變數名稱
+  final List<String> envInvalid;
+
   /// 讀檔或解析失敗時的錯誤訊息
   final String? error;
 
@@ -52,6 +55,7 @@ class RfidTimingLoadResult {
     this.filePath,
     this.fileFound = false,
     this.envOverrides = const [],
+    this.envInvalid = const [],
     this.error,
   });
 
@@ -68,6 +72,9 @@ class RfidTimingLoadResult {
     }
     if (envOverrides.isNotEmpty) {
       parts.add('環境變數覆寫: ${envOverrides.join(', ')}');
+    }
+    if (envInvalid.isNotEmpty) {
+      parts.add('環境變數不是整數，已忽略: ${envInvalid.join(', ')}');
     }
     return parts.join('；');
   }
@@ -134,6 +141,13 @@ class RfidTimingConfig {
   /// 一顆回報線路異常、晶片無回應或 SPI 寫入錯誤時，重新上電再讀幾次。
   final int readerRetries;
 
+  /// 持續背景輪巡時，一輪結束到下一輪開始的休息時間 (ms)。0 代表不停地掃。
+  final int pollGapMs;
+
+  /// 黏性合併：某顆這一輪沒讀到卡片 (或線路異常) 時，距離上次讀到不超過這麼多輪
+  /// 就先保留上次的卡片，超過才清掉；讀到不同的 UID 則立刻換掉。0 代表不保留。
+  final int stickyRounds;
+
   /// 每顆讀卡機的覆寫值：deviceId ("01"…"07") → {欄位: 值}。
   /// 只允許 [perReaderKeys] 裡的欄位，其他會被忽略。
   final Map<String, Map<String, int>> readerOverrides;
@@ -142,20 +156,24 @@ class RfidTimingConfig {
     this.spiSpeedHz = 1000000,
     this.rstSettleMs = 50,
     this.linkCheckTimeoutMs = 50,
-    this.antennaSettleMs = 5,
+    this.antennaSettleMs = 200,
     this.reqaTimeoutMs = 25,
-    this.reqaAttempts = 2,
+    this.reqaAttempts = 3,
     this.commDeadlineMs = 50,
-    this.interReaderGapMs = 1,
+    this.interReaderGapMs = 200,
     this.postScanSettleMs = 0,
     this.scanTimeoutSec = 10,
     this.writeVerifyRetries = 2,
     this.anticollRetries = 2,
     this.readerRetries = 1,
+    this.pollGapMs = 300,
+    this.stickyRounds = 3,
     this.readerOverrides = const {},
   });
 
-  /// 程式內建預設值
+  /// 程式內建預設值。等待值刻意保守 (天線 200 ms、顆間 200 ms、REQA 3 次，
+  /// 一輪約 3.5 秒)：長線的機器第一次開機就要能用，之後用「自動最佳化」
+  /// 把每顆縮到最小可靠值。
   static const RfidTimingConfig defaults = RfidTimingConfig();
 
   /// [effectiveCommDeadlineMs] 至少比 [reqaTimeoutMs] 多這麼多 (ms)，
@@ -177,6 +195,8 @@ class RfidTimingConfig {
     'writeVerifyRetries',
     'anticollRetries',
     'readerRetries',
+    'pollGapMs',
+    'stickyRounds',
   ];
 
   /// 可以對單顆讀卡機覆寫的欄位
@@ -207,6 +227,8 @@ class RfidTimingConfig {
     'writeVerifyRetries': (0, 5),
     'anticollRetries': (0, 5),
     'readerRetries': (0, 3),
+    'pollGapMs': (0, 5000),
+    'stickyRounds': (0, 20),
   };
 
   /// 每個欄位的中文說明，給設定頁與 CLI 用
@@ -224,6 +246,8 @@ class RfidTimingConfig {
     'writeVerifyRetries': '暫存器重寫次數',
     'anticollRetries': 'anticoll 重送次數',
     'readerRetries': '重新上電再讀次數',
+    'pollGapMs': '背景輪巡間隔 (ms)',
+    'stickyRounds': '卡片保留輪數',
   };
 
   /// 每個欄位的一句話說明，給設定頁的編輯表單用
@@ -231,16 +255,18 @@ class RfidTimingConfig {
     'spiSpeedHz': '整條 bus 共用。線長或負載重時降到 500000 / 250000。',
     'rstSettleMs': 'RST 拉高後等振盪器啟動。datasheet 只需幾 ms，50 是保守值。',
     'linkCheckTimeoutMs': 'VersionReg 讀不到時最多再等多久，正常時用不到。',
-    'antennaSettleMs': '天線開啟後讓卡片上電。ISO 14443 要求 5 ms 內就緒。',
+    'antennaSettleMs': '天線開啟後讓卡片上電。ISO 14443 要求 5 ms 內就緒，200 是長線的保守起點，最佳化會往下縮。',
     'reqaTimeoutMs': '沒卡時每次 REQA 要等這麼久才放棄。',
-    'reqaAttempts': '每顆 REQA 最多試幾次。',
+    'reqaAttempts': '每顆 REQA 最多試幾次。有卡時第一次通常就中，只有沒卡時才會全部試完。',
     'commDeadlineMs': '軟體端等 IRQ 的上限，會自動 ≥ REQA 逾時 + 25。',
-    'interReaderGapMs': '兩顆之間的間隔。',
+    'interReaderGapMs': '兩顆之間的間隔，最後一顆之後不等。200 是保守起點，最佳化不掃這一項。',
     'postScanSettleMs': '整輪結束後的額外等待。',
     'scanTimeoutSec': '整輪超過這個時間視為硬體卡死。會自動 ≥ 最壞情況 × 2。',
     'writeVerifyRetries': '寫入後讀回不符就重寫，吃掉長線的偶發位元錯誤。0 = 只寫不驗證。',
     'anticollRetries': 'UID 校驗失敗時直接重送 anticoll 的次數，之後才重做 REQA。',
     'readerRetries': '線路異常、無回應或 SPI 錯誤時，重新上電再讀的次數。',
+    'pollGapMs': '持續背景輪巡時每輪之間的休息時間。',
+    'stickyRounds': '這一輪沒讀到時先保留上次的卡片幾輪，偶發漏讀才不會閃爍。',
   };
 
   /// 軟體等待 IRQ 的實際上限：至少 [reqaTimeoutMs] + [commDeadlineMarginMs]
@@ -275,6 +301,8 @@ class RfidTimingConfig {
         'writeVerifyRetries': writeVerifyRetries,
         'anticollRetries': anticollRetries,
         'readerRetries': readerRetries,
+        'pollGapMs': pollGapMs,
+        'stickyRounds': stickyRounds,
       };
 
   /// 全域欄位加上 `readers` 區段 (沒有覆寫時省略)
@@ -309,7 +337,9 @@ class RfidTimingConfig {
             values[key] = value;
           }
         }
-        if (values.isNotEmpty) overrides[entry.key.toString()] = values;
+        if (values.isNotEmpty) {
+          overrides[normalizeDeviceId(entry.key.toString())] = values;
+        }
       }
     } else if (base.readerOverrides.isNotEmpty) {
       for (final entry in base.readerOverrides.entries) {
@@ -331,8 +361,18 @@ class RfidTimingConfig {
       writeVerifyRetries: pick('writeVerifyRetries', base.writeVerifyRetries),
       anticollRetries: pick('anticollRetries', base.anticollRetries),
       readerRetries: pick('readerRetries', base.readerRetries),
+      pollGapMs: pick('pollGapMs', base.pollGapMs),
+      stickyRounds: pick('stickyRounds', base.stickyRounds),
       readerOverrides: overrides,
     );
+  }
+
+  /// 讀卡機 id 正規化：`7` → `07`。覆寫的 key 是兩位數的 deviceId，
+  /// 手動寫 `"7"` 或 CLI 打 `7.rstSettleMs` 也要能對到 `"07"`。
+  static String normalizeDeviceId(String raw) {
+    final trimmed = raw.trim();
+    final number = int.tryParse(trimmed);
+    return number == null ? trimmed : number.toString().padLeft(2, '0');
   }
 
   /// 把 JSON、環境變數裡的值轉成整數；轉不出來就回 null。
@@ -364,7 +404,7 @@ class RfidTimingConfig {
 
   /// 某顆讀卡機實際生效的設定：全域值套上該顆的覆寫，結果不再帶 [readerOverrides]。
   RfidTimingConfig forReader(String deviceId) {
-    final overrides = readerOverrides[deviceId];
+    final overrides = readerOverrides[normalizeDeviceId(deviceId)];
     if (overrides == null || overrides.isEmpty) return withoutReaderOverrides();
     final json = Map<String, dynamic>.from(toBaseJson());
     for (final entry in overrides.entries) {
@@ -394,7 +434,7 @@ class RfidTimingConfig {
       for (final entry in readerOverrides.entries)
         entry.key: Map<String, int>.from(entry.value),
     };
-    final target = merged.putIfAbsent(deviceId, () => {});
+    final target = merged.putIfAbsent(normalizeDeviceId(deviceId), () => {});
     for (final entry in values.entries) {
       if (perReaderKeys.contains(entry.key)) target[entry.key] = entry.value;
     }
@@ -404,10 +444,10 @@ class RfidTimingConfig {
   /// 清掉某顆 (或全部) 讀卡機的覆寫
   RfidTimingConfig clearReaderOverrides([String? deviceId]) {
     if (deviceId == null) return withoutReaderOverrides();
+    final target = normalizeDeviceId(deviceId);
     final remaining = <String, Map<String, int>>{
       for (final entry in readerOverrides.entries)
-        if (entry.key != deviceId)
-          entry.key: Map<String, int>.from(entry.value),
+        if (entry.key != target) entry.key: Map<String, int>.from(entry.value),
     };
     return copyWith(readerOverrides: remaining);
   }
@@ -426,6 +466,8 @@ class RfidTimingConfig {
     int? writeVerifyRetries,
     int? anticollRetries,
     int? readerRetries,
+    int? pollGapMs,
+    int? stickyRounds,
     Map<String, Map<String, int>>? readerOverrides,
   }) {
     return RfidTimingConfig(
@@ -442,6 +484,8 @@ class RfidTimingConfig {
       writeVerifyRetries: writeVerifyRetries ?? this.writeVerifyRetries,
       anticollRetries: anticollRetries ?? this.anticollRetries,
       readerRetries: readerRetries ?? this.readerRetries,
+      pollGapMs: pollGapMs ?? this.pollGapMs,
+      stickyRounds: stickyRounds ?? this.stickyRounds,
       readerOverrides: readerOverrides ?? this.readerOverrides,
     );
   }
@@ -482,17 +526,23 @@ class RfidTimingConfig {
     return buffer.toString();
   }
 
-  /// 套用環境變數覆寫 (只影響全域欄位)。[applied] 會收到實際被覆寫的欄位名稱。
+  /// 套用環境變數覆寫 (只影響全域欄位)。[applied] 會收到實際被覆寫的欄位名稱，
+  /// [invalid] 會收到有設定但不是整數、被忽略的環境變數名稱。
   RfidTimingConfig applyEnvironment(
     Map<String, String> environment, {
     List<String>? applied,
+    List<String>? invalid,
   }) {
     var result = this;
     for (final key in keys) {
-      final raw = environment[envKeyFor(key)];
+      final envKey = envKeyFor(key);
+      final raw = environment[envKey];
       if (raw == null) continue;
       final value = parseIntValue(raw);
-      if (value == null) continue;
+      if (value == null) {
+        invalid?.add(envKey);
+        continue;
+      }
       result = result.withValue(key, value);
       applied?.add(key);
     }
@@ -545,13 +595,17 @@ class RfidTimingConfig {
     }
 
     final overrides = <String>[];
-    config = config.applyEnvironment(env, applied: overrides).validated();
+    final invalid = <String>[];
+    config = config
+        .applyEnvironment(env, applied: overrides, invalid: invalid)
+        .validated();
 
     return RfidTimingLoadResult(
       config: config,
       filePath: path,
       fileFound: fileFound,
       envOverrides: overrides,
+      envInvalid: invalid,
       error: error,
     );
   }
@@ -616,19 +670,24 @@ class RfidTimingConfig {
     return perAttempt * (1 + timing.readerRetries) + timing.interReaderGapMs;
   }
 
+  /// 顆間間隔只在兩顆之間，最後一顆之後不等：整輪要扣掉一次
+  int _cycleTail(int readerCount) =>
+      postScanSettleMs - (readerCount > 0 ? interReaderGapMs : 0);
+
   /// 估算無卡時一輪掃描的時間 (ms)，只用全域值 (不看覆寫)
   int estimateNoCardScanMs(int readerCount) =>
-      noCardReaderMs(withoutReaderOverrides()) * readerCount + postScanSettleMs;
+      noCardReaderMs(withoutReaderOverrides()) * readerCount +
+      _cycleTail(readerCount);
 
   /// 估算無卡時一輪掃描的時間 (ms)，每顆用各自生效的值
   int estimateNoCardScanMsFor(Iterable<String> deviceIds) =>
       deviceIds.fold<int>(0, (sum, id) => sum + noCardReaderMs(forReader(id))) +
-      postScanSettleMs;
+      _cycleTail(deviceIds.length);
 
   /// 估算七顆都有卡時一輪掃描的時間 (ms)，每顆用各自生效的值
   int estimateAllCardsScanMsFor(Iterable<String> deviceIds) =>
       deviceIds.fold<int>(0, (sum, id) => sum + cardReaderMs(forReader(id))) +
-      postScanSettleMs;
+      _cycleTail(deviceIds.length);
 
   /// 估算最壞情況一輪的時間 (ms)。有覆寫時每顆取全域值與覆寫值中較大的那個。
   int estimateWorstCaseScanMs(int readerCount) {
@@ -640,7 +699,7 @@ class RfidTimingConfig {
         }
       }
     }
-    return worstCaseReaderMs(worst) * readerCount + postScanSettleMs;
+    return worstCaseReaderMs(worst) * readerCount + _cycleTail(readerCount);
   }
 
   /// 整輪掃描實際使用的逾時：設定值與「最壞情況 × 2」取較大者，
@@ -683,6 +742,8 @@ class RfidTimingConfig {
       other.writeVerifyRetries == writeVerifyRetries &&
       other.anticollRetries == anticollRetries &&
       other.readerRetries == readerRetries &&
+      other.pollGapMs == pollGapMs &&
+      other.stickyRounds == stickyRounds &&
       other._canonicalOverrides() == _canonicalOverrides();
 
   @override
@@ -700,6 +761,8 @@ class RfidTimingConfig {
         writeVerifyRetries,
         anticollRetries,
         readerRetries,
+        pollGapMs,
+        stickyRounds,
         _canonicalOverrides(),
       );
 

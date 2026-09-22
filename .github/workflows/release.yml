@@ -19,6 +19,11 @@ env:
 permissions:
   contents: read
 
+# Container jobs default to sh; the run steps below use bash syntax.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false

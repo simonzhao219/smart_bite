@@ -440,22 +440,40 @@ class OrderPage extends StatelessWidget {
     }
 
     // If no cards detected, show message
-    if (cardsWithMeals.isEmpty) {
-      return const _OrderCard(
-        width: 390,
-        status: ReaderStatus.init,
-        mealName: '沒收到您的點餐，是不知道要吃什麼嗎？可以請服務人員為您推薦！',
-        readerNumber: null,
-      );
-    }
+    final Widget content = cardsWithMeals.isEmpty
+        ? const _OrderCard(
+            width: 390,
+            status: ReaderStatus.init,
+            mealName: '沒收到您的點餐，是不知道要吃什麼嗎？可以請服務人員為您推薦！',
+            readerNumber: null,
+          )
+        : Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            direction: Axis.horizontal,
+            alignment: WrapAlignment.center,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: cardsWithMeals,
+          );
 
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      direction: Axis.horizontal,
-      alignment: WrapAlignment.center,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: cardsWithMeals,
+    // 線路異常的讀卡機要明確提示，不能讓使用者以為只是沒放餐盤
+    final errorIds = context.read<RFIDReaderProvider>().errorReaderIds;
+    if (errorIds.isEmpty) return content;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        content,
+        const SizedBox(height: 8),
+        Text(
+          '讀卡機 ${errorIds.join('、')} 線路異常，請檢查接線後按「重新感應」',
+          style: TextStyle(
+            color: Colors.red[700],
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
     );
   }
 }

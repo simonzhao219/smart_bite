@@ -318,15 +318,26 @@ RFID_MODE=gpio flutter run
 
 ### Expected Scan Times
 
-- **Serial (Current)**: 10s default (configurable 3-20s)
-- **GPIO/SPI (Target)**: 1-2s total for 7 modules
+- **GPIO/SPI**: 約 0.8s for 7 modules with the conservative defaults (no card on any reader);
+  約 0.5s after calibration. The old implementation took 約 12s because of hard-coded
+  500 ms sleeps, and the time grew with cable length because the IRQ wait loop was
+  bounded by a read count instead of wall-clock time.
 - **Mock**: ~100ms (configurable delay)
+
+### Timing Configuration and Calibration
+
+All RC522 timing values (RST settle, antenna settle, REQA timeout/attempts, SPI clock,
+deadlines) live in `RfidTimingConfig` and can be overridden without recompiling via
+`~/Documents/rfid_timing.json` or `RFID_*` environment variables.
+`scripts/rfid_calibrate.dart` measures each reader's link quality at several SPI clocks
+and recommends values. See [RFID_TIMING_TUNING.md](RFID_TIMING_TUNING.md).
 
 ### Optimization Tips
 
-1. Ensure proper RC522 antenna configuration
-2. Use shorter cables for SPI connections
-3. Minimize electrical noise near RFID modules
+1. Run `dart run scripts/rfid_calibrate.dart recommend --write` on the Pi after wiring changes
+2. Lower `spiSpeedHz` (500 kHz / 250 kHz) for long cables; each transfer is only 2 bytes
+3. Keep a GND wire next to SCK/MOSI/MISO and decouple each module's 3.3V
+4. Minimize electrical noise near RFID modules
 
 ## API Reference
 

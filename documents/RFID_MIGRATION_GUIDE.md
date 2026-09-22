@@ -89,18 +89,18 @@ final reading = await adapter.scan();
 Direct communication with RC522 modules on Raspberry Pi:
 
 **Hardware Topology:**
-- **Shared SPI Bus**: MISO (GPIO 9), MOSI (GPIO 10), SCK (GPIO 11)
-- **Unique per module**: RST and SDA/SS pins
+- **Shared SPI Bus** (`/dev/spidev0.0`): MISO (GPIO 9), MOSI (GPIO 10), SCK (GPIO 11), CE0 (GPIO 8, wired to the SDA/SS of all 7 modules)
+- **Unique per module**: RST pin only. Module selection is by RST (one high at a time); there is no per-module SS pin.
 
-**Default Pin Configuration (7 modules):**
+**Default Pin Configuration (7 modules, `defaultReaderConfigs` in `lib/models/rfid_models.dart`):**
 ```dart
-Module 1: RST=GPIO17, SS=GPIO8
-Module 2: RST=GPIO27, SS=GPIO7
-Module 3: RST=GPIO22, SS=GPIO25
-Module 4: RST=GPIO23, SS=GPIO24
-Module 5: RST=GPIO18, SS=GPIO12
-Module 6: RST=GPIO15, SS=GPIO16
-Module 7: RST=GPIO14, SS=GPIO20
+Module 1: RST=GPIO22
+Module 2: RST=GPIO27
+Module 3: RST=GPIO17
+Module 4: RST=GPIO4
+Module 5: RST=GPIO23
+Module 6: RST=GPIO24
+Module 7: RST=GPIO25
 ```
 
 **Protocol:** MFRC522 (ISO14443A, 13.56 MHz)
@@ -400,9 +400,8 @@ void main() {
 // Test GPIO control without actual RFID modules
 final config = RC522Config(
   deviceId: '01',
-  spiDevice: '/dev/spidev0.0',
-  rstPin: 17,
-  ssPin: 8,
+  spiNum: 0, // /dev/spidev0.0
+  rstPin: 22,
 );
 final adapter = GPIOSPIRFIDAdapter(config: config);
 await adapter.connect(); // Should configure GPIO pins
@@ -482,8 +481,8 @@ Override default pin assignments:
 
 ```dart
 final customConfigs = [
-  RC522Config(deviceId: '01', spiDevice: '/dev/spidev0.0', rstPin: 5, ssPin: 6),
-  RC522Config(deviceId: '02', spiDevice: '/dev/spidev0.0', rstPin: 13, ssPin: 19),
+  RC522Config(deviceId: '01', spiNum: 0, rstPin: 5),
+  RC522Config(deviceId: '02', spiNum: 0, rstPin: 13),
   // ... 5 more
 ];
 

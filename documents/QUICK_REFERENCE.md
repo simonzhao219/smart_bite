@@ -53,7 +53,7 @@ final mockManager = RFIDReaderFactory.createReaderManager(
 
 // Custom GPIO configuration
 final customManager = RFIDReaderFactory.createCustomGPIOReaderManager([
-  RC522Config(deviceId: '01', spiDevice: '/dev/spidev0.0', rstPin: 17, ssPin: 8),
+  RC522Config(deviceId: '01', spiNum: 0, rstPin: 22),
   // ... more configs
 ]);
 ```
@@ -96,17 +96,19 @@ Map<String, int> stats = service.getIdentificationStats(readings);
 
 ### Default GPIO Pins (Raspberry Pi)
 
-| Module | Device ID | RST Pin | SS Pin  |
-|--------|-----------|---------|---------|
-| 1      | 01        | GPIO 17 | GPIO 8  |
-| 2      | 02        | GPIO 27 | GPIO 7  |
-| 3      | 03        | GPIO 22 | GPIO 25 |
-| 4      | 04        | GPIO 23 | GPIO 24 |
-| 5      | 05        | GPIO 18 | GPIO 12 |
-| 6      | 06        | GPIO 15 | GPIO 16 |
-| 7      | 07        | GPIO 14 | GPIO 20 |
+Source of truth: `defaultReaderConfigs` in `lib/models/rfid_models.dart`.
 
-**Shared SPI:** MISO=GPIO9, MOSI=GPIO10, SCK=GPIO11
+| Module | Device ID | RST Pin |
+|--------|-----------|---------|
+| 1      | 01        | GPIO 22 |
+| 2      | 02        | GPIO 27 |
+| 3      | 03        | GPIO 17 |
+| 4      | 04        | GPIO 4  |
+| 5      | 05        | GPIO 23 |
+| 6      | 06        | GPIO 24 |
+| 7      | 07        | GPIO 25 |
+
+**Shared SPI (`/dev/spidev0.0`):** MISO=GPIO9, MOSI=GPIO10, SCK=GPIO11, CE0=GPIO8 (SDA/SS of all 7 modules). Module selection is by RST; there is no per-module SS pin.
 
 ## 🧪 Testing
 

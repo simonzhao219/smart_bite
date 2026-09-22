@@ -67,15 +67,15 @@ Fully implemented Raspberry Pi GPIO/SPI adapter:
 - ✅ Hardware reset and antenna initialization
 - ✅ Register configuration (timer, tx/rx modes, modulation)
 
-**Default Pin Mapping:**
+**Default Pin Mapping** (`defaultReaderConfigs` in `lib/models/rfid_models.dart`):
 ```
-Module 1: RST=GPIO17, SS=GPIO8   | Shared: MISO=GPIO9
-Module 2: RST=GPIO27, SS=GPIO7   |         MOSI=GPIO10
-Module 3: RST=GPIO22, SS=GPIO25  |         SCK=GPIO11
-Module 4: RST=GPIO23, SS=GPIO24  |         (SPI0)
-Module 5: RST=GPIO18, SS=GPIO12  |
-Module 6: RST=GPIO15, SS=GPIO16  |
-Module 7: RST=GPIO14, SS=GPIO20  |
+Module 1: RST=GPIO22   | Shared (SPI0, /dev/spidev0.0):
+Module 2: RST=GPIO27   |   MISO=GPIO9
+Module 3: RST=GPIO17   |   MOSI=GPIO10
+Module 4: RST=GPIO4    |   SCK=GPIO11
+Module 5: RST=GPIO23   |   CE0=GPIO8 (SDA/SS of all 7 modules)
+Module 6: RST=GPIO24   |
+Module 7: RST=GPIO25   | Module selection is by RST; no per-module SS pin.
 ```
 
 **Status:** **COMPLETE - Ready for hardware testing on Raspberry Pi.**

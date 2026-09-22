@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Keep in sync with FLUTTER_VERSION in release.yml.
+env:
+  FLUTTER_VERSION: "3.47.5"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-test:
+    name: Analyze & test (linux-x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Get dependencies (must match pubspec.lock)
+        run: flutter pub get --enforce-lockfile
+
+      # Errors and warnings fail the job; deprecation infos are only reported.
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos
+
+      - name: Test
+        run: flutter test

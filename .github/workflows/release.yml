@@ -1,0 +1,148 @@
+name: Release (Raspberry Pi 4, linux-arm64)
+
+# Builds the Linux desktop bundle for Raspberry Pi 4 (64-bit Raspberry Pi OS,
+# Bookworm or newer) and publishes it as a GitHub Release asset that
+# scripts/install.sh can fetch with curl.
+#
+#   git tag v1.2.0 && git push origin v1.2.0   -> build + GitHub Release
+#   "Run workflow" button (workflow_dispatch)  -> build only, tarball as artifact
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Keep in sync with FLUTTER_VERSION in ci.yml.
+env:
+  FLUTTER_VERSION: "3.47.5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-arm64:
+    name: Build linux-arm64 (Debian 12 bookworm)
+    # Native arm64 runner (free for public repositories), so no QEMU/cross-compiling.
+    # The Debian 12 container matches Raspberry Pi OS Bookworm, so the binary links
+    # against the same glibc/GTK versions the Pi has (Ubuntu 24.04 would need glibc 2.38+).
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bookworm
+    timeout-minutes: 90
+    env:
+      FLUTTER_HOME: /opt/flutter
+      PUB_CACHE: /github/home/.pub-cache
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git unzip xz-utils zip zstd \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Restore Flutter SDK cache
+        id: flutter-cache
+        uses: actions/cache@v5
+        with:
+          path: /opt/flutter
+          key: flutter-sdk-${{ env.FLUTTER_VERSION }}-linux-arm64-bookworm-v1
+
+      - name: Install Flutter ${{ env.FLUTTER_VERSION }}
+        if: steps.flutter-cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch "${FLUTTER_VERSION}" https://github.com/flutter/flutter.git "${FLUTTER_HOME}"
+
+      - name: Set up Flutter
+        run: |
+          git config --global --add safe.directory "${FLUTTER_HOME}"
+          echo "${FLUTTER_HOME}/bin" >> "${GITHUB_PATH}"
+          "${FLUTTER_HOME}/bin/flutter" config --no-analytics --enable-linux-desktop
+          "${FLUTTER_HOME}/bin/flutter" precache --linux
+          "${FLUTTER_HOME}/bin/flutter" --version
+          "${FLUTTER_HOME}/bin/flutter" doctor -v || true
+
+      - name: Restore pub cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.PUB_CACHE }}
+          key: pub-linux-arm64-${{ hashFiles('pubspec.lock') }}
+          restore-keys: pub-linux-arm64-
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            base="$(sed -n 's/^version: *\([^+ ]*\).*/\1/p' pubspec.yaml)"
+            version="${base:-0.0.0}-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Building smart_bite ${version}"
+
+      - name: Get dependencies (must match pubspec.lock)
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build release bundle
+        run: flutter build linux --release --target-platform linux-arm64
+
+      - name: Package
+        run: scripts/package_linux.sh arm64 "${{ steps.version.outputs.version }}"
+
+      - name: Bundle summary
+        run: |
+          {
+            echo "## smart_bite ${{ steps.version.outputs.version }} (linux-arm64)"
+            echo '```'
+            ls -l dist/
+            cat dist/smart_bite-linux-arm64.tar.gz.sha256
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: smart_bite-linux-arm64
+          path: dist/smart_bite-linux-arm64.tar.gz*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-linux-arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: smart_bite-linux-arm64
+          path: dist
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          extra=()
+          if [[ "${TAG}" == *-* ]]; then
+            extra+=(--prerelease)
+          fi
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; replacing assets"
+            gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber \
+              dist/smart_bite-linux-arm64.tar.gz dist/smart_bite-linux-arm64.tar.gz.sha256 scripts/install.sh
+          else
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "Smart Bite ${TAG}" --generate-notes --verify-tag "${extra[@]}" \
+              dist/smart_bite-linux-arm64.tar.gz dist/smart_bite-linux-arm64.tar.gz.sha256 scripts/install.sh
+          fi

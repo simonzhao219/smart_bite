@@ -131,7 +131,7 @@ The app uses the **Provider** pattern for:
    - ID-based meal lookup
 
 3. **Hardware Integration**
-   - Serial port communication (possibly with a physical device)
+   - 7 顆 RC522 經 GPIO/SPI 輪巡，時序可調、可校正 (見 `documents/RFID_TIMING_TUNING.md`)
    - Real-time data exchange
 
 4. **Report Generation**

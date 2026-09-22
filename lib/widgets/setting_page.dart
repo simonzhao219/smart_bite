@@ -68,6 +68,10 @@ class SettingPage extends StatelessWidget {
         _buildPlatformInfo(context),
         const SizedBox(height: 16),
 
+        // 輪巡時序設定 (可收合)
+        _buildTimingInfo(context, rfidProvider),
+        const SizedBox(height: 16),
+
         // Reader Status Cards
         Expanded(
           child: _buildReaderStatusSection(context, rfidProvider),
@@ -129,6 +133,75 @@ class SettingPage extends StatelessWidget {
     }
   }
 
+  /// 輪巡時序設定與診斷 (預設收合，展開才佔空間)
+  Widget _buildTimingInfo(BuildContext context, RFIDReaderProvider provider) {
+    final diagnostics = provider.diagnostics;
+    final scanMs = provider.lastScanDuration?.inMilliseconds;
+    final textTheme = Theme.of(context).textTheme;
+
+    return Card(
+      elevation: 2,
+      child: ExpansionTile(
+        leading: const Icon(Icons.timer_outlined),
+        title: Text(
+          '輪巡時序設定',
+          style: textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+        ),
+        subtitle: Text(
+          scanMs != null ? '上次掃描耗時 $scanMs ms' : '尚未掃描',
+          style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        expandedCrossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final entry in diagnostics.entries)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: 170,
+                    child: Text(
+                      entry.key,
+                      style: textTheme.bodySmall
+                          ?.copyWith(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  Expanded(
+                    child: SelectableText(
+                      entry.value,
+                      style: textTheme.bodySmall,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              OutlinedButton.icon(
+                onPressed: provider.isScanning
+                    ? null
+                    : () => provider.reloadSettings(),
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('重新載入設定檔'),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  '校正工具: dart run scripts/rfid_calibrate.dart '
+                  '(說明見 documents/RFID_TIMING_TUNING.md)',
+                  style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildReaderStatusSection(
     BuildContext context,
     RFIDReaderProvider provider,
@@ -160,9 +233,10 @@ class SettingPage extends StatelessWidget {
 
             const SizedBox(height: 8),
 
-            // Last update timestamp
+            // Last update timestamp and duration
             Text(
-              '最後掃描: ${minutesAgo == 0 ? "剛剛" : "$minutesAgo 分鐘前"}',
+              '最後掃描: ${minutesAgo == 0 ? "剛剛" : "$minutesAgo 分鐘前"}'
+              '${provider.lastScanDuration != null ? "，耗時 ${provider.lastScanDuration!.inMilliseconds} ms" : ""}',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: Colors.grey[600],
                   ),
@@ -192,6 +266,7 @@ class SettingPage extends StatelessWidget {
                         address: reader.address,
                         rfidId: rfidId,
                         dishName: dishName,
+                        detail: reading?.errorMessage ?? reading?.rawData,
                       ),
                     );
                   }).toList(),
@@ -317,15 +392,13 @@ class SettingPage extends StatelessWidget {
                             dataProvider.printerName.isEmpty
                                 ? '未選擇印表機'
                                 : dataProvider.printerName,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyLarge
-                                ?.copyWith(
-                                  fontWeight: FontWeight.w500,
-                                  color: dataProvider.printerName.isEmpty
-                                      ? Colors.red
-                                      : null,
-                                ),
+                            style:
+                                Theme.of(context).textTheme.bodyLarge?.copyWith(
+                                      fontWeight: FontWeight.w500,
+                                      color: dataProvider.printerName.isEmpty
+                                          ? Colors.red
+                                          : null,
+                                    ),
                             overflow: TextOverflow.ellipsis,
                           ),
                         ],
@@ -571,12 +644,16 @@ class _ReaderStatusRow extends StatelessWidget {
   final String rfidId;
   final String? dishName;
 
+  /// 錯誤訊息或診斷摘要 (版本、耗時)，顯示在卡片資訊區
+  final String? detail;
+
   const _ReaderStatusRow({
     required this.deviceId,
     required this.status,
     required this.address,
     required this.rfidId,
     this.dishName,
+    this.detail,
   });
 
   @override
@@ -596,7 +673,7 @@ class _ReaderStatusRow extends StatelessWidget {
               size: 32,
             ),
             const SizedBox(width: 16),
-            
+
             // Reader Info
             Expanded(
               flex: 2,
@@ -626,10 +703,11 @@ class _ReaderStatusRow extends StatelessWidget {
                         ),
                         child: Text(
                           status.displayName,
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: status.color,
-                                fontWeight: FontWeight.w600,
-                              ),
+                          style:
+                              Theme.of(context).textTheme.bodySmall?.copyWith(
+                                    color: status.color,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -644,9 +722,9 @@ class _ReaderStatusRow extends StatelessWidget {
                 ],
               ),
             ),
-            
+
             const SizedBox(width: 16),
-            
+
             // Card Detection Info
             Expanded(
               flex: 3,
@@ -677,7 +755,7 @@ class _ReaderStatusRow extends StatelessWidget {
             size: 24,
           ),
           const SizedBox(width: 12),
-          
+
           // RFID Info
           Expanded(
             child: Column(
@@ -736,26 +814,46 @@ class _ReaderStatusRow extends StatelessWidget {
   }
 
   Widget _buildNoCardInfo(BuildContext context) {
+    final isError = status == ReaderStatus.error;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.grey[100],
+        color: isError ? Colors.red[50] : Colors.grey[100],
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.grey[300]!),
+        border: Border.all(
+          color: isError ? Colors.red[200]! : Colors.grey[300]!,
+        ),
       ),
       child: Row(
         children: [
           Icon(
-            Icons.credit_card_off,
+            isError ? Icons.link_off : Icons.credit_card_off,
             size: 24,
-            color: Colors.grey[500],
+            color: isError ? Colors.red[700] : Colors.grey[500],
           ),
           const SizedBox(width: 12),
-          Text(
-            '未偵測到卡片',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: Colors.grey[600],
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isError ? '線路異常，請檢查接線' : '未偵測到卡片',
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: isError ? Colors.red[900] : Colors.grey[600],
+                        fontWeight: isError ? FontWeight.w600 : null,
+                      ),
                 ),
+                if (detail != null && detail!.isNotEmpty)
+                  Text(
+                    detail!,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Colors.grey[600],
+                        ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+              ],
+            ),
           ),
         ],
       ),

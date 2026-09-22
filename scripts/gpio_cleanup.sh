@@ -14,8 +14,8 @@
 set -e  # Exit on error
 
 # GPIO pins used by Smart Bite RFID readers (RST pins)
-# Based on typical RC522 configuration - adjust if your setup differs
-GPIO_PINS=(17 27 22 23 24 25 26)
+# Must match defaultReaderConfigs in lib/models/rfid_models.dart
+GPIO_PINS=(22 27 17 4 23 24 25)
 
 echo "🧹 Smart Bite GPIO Cleanup Starting..."
 echo "================================================"

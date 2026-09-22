@@ -94,6 +94,54 @@ class PICCCommands {
 class MFRC522Status {
   static const int ok = 0;
   static const int error = 1;
+
+  /// 晶片 timer 逾時：晶片有正常回應，但場內沒有卡片
   static const int notag = 2;
   static const int collision = 3;
+
+  /// 軟體牆鐘逾時：晶片在期限內連 timer IRQ 都沒舉起，
+  /// 通常是 SPI 線路或供電問題，而不是「沒有卡」
+  static const int timeout = 4;
+
+  static String describe(int status) {
+    switch (status) {
+      case ok:
+        return 'ok';
+      case error:
+        return 'error';
+      case notag:
+        return 'no_tag';
+      case collision:
+        return 'collision';
+      case timeout:
+        return 'comm_timeout';
+      default:
+        return 'unknown($status)';
+    }
+  }
+}
+
+/// VersionReg (0x37) 的已知值
+class MFRC522Version {
+  static const int v1 = 0x91;
+  static const int v2 = 0x92;
+
+  /// 讀到 0x00 或 0xFF 幾乎都代表 MISO 沒有真的接到晶片
+  static bool isPlausible(int value) => value != 0x00 && value != 0xFF;
+
+  static String describe(int value) {
+    final hex = '0x${value.toRadixString(16).padLeft(2, '0').toUpperCase()}';
+    switch (value) {
+      case v1:
+        return '$hex (MFRC522 v1.0)';
+      case v2:
+        return '$hex (MFRC522 v2.0)';
+      case 0x00:
+        return '$hex (無回應，MISO 讀到全 0)';
+      case 0xFF:
+        return '$hex (無回應，MISO 讀到全 1)';
+      default:
+        return '$hex (相容晶片)';
+    }
+  }
 }

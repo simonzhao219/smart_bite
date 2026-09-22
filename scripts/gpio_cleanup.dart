@@ -14,14 +14,15 @@ library gpio_cleanup;
 import 'dart:io';
 
 import 'package:dart_periphery/dart_periphery.dart';
+import 'package:smart_bite/models/rfid_models.dart';
 
 // ignore_for_file: avoid_print
 
 class GPIOCleanup {
   /// GPIO pins used by Smart Bite RFID readers (RST pins)
-  /// These should match the configuration in your app
-  /// Adjust based on your RC522 wiring setup
-  static const List<int> rfidResetPins = [17, 27, 22, 23, 24, 25, 26];
+  /// 與 app 使用同一份接線表 [defaultReaderConfigs]，改接線時只要改那一處
+  static final List<int> rfidResetPins =
+      defaultReaderConfigs.map((config) => config.rstPin).toList();
 
   /// Cleanup all RFID GPIO pins
   /// 

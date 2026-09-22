@@ -137,6 +137,7 @@ class MockRFIDReaderManager extends ChangeNotifier
     implements RFIDReaderManager {
   List<MockRFIDAdapter> _readers = [];
   final Map<String, RFIDReading> _latestReadings = {};
+  Duration? _lastScanDuration;
 
   /// Create a manager with predefined test scenario
   ///
@@ -218,9 +219,11 @@ class MockRFIDReaderManager extends ChangeNotifier
       _readers.add(MockRFIDAdapter(deviceId: deviceId, mockRfidSequence: []));
     }
 
+    final stopwatch = Stopwatch()..start();
     final readings = await Future.wait(
       _readers.map((reader) => reader.scan()),
     );
+    _lastScanDuration = stopwatch.elapsed;
 
     // Update latest readings cache
     for (final reading in readings) {
@@ -229,6 +232,17 @@ class MockRFIDReaderManager extends ChangeNotifier
 
     notifyListeners();
     return readings;
+  }
+
+  @override
+  Duration? get lastScanDuration => _lastScanDuration;
+
+  @override
+  Map<String, String> get diagnostics => const {'模式': 'Mock (模擬讀卡機，無硬體時序設定)'};
+
+  @override
+  Future<void> reloadSettings() async {
+    // Mock 沒有可重新載入的設定
   }
 
   @override

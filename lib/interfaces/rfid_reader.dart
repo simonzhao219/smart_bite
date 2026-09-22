@@ -167,6 +167,15 @@ abstract class RFIDReaderManager extends ChangeNotifier {
   
   /// Get all readings that have valid RFID cards detected
   List<RFIDReading> get validReadings;
+
+  /// 上一次 [scanAll] 花的時間；實作不支援時為 null
+  Duration? get lastScanDuration;
+
+  /// 給設定頁顯示的診斷資訊 (時序設定、來源、各讀卡機摘要)；沒有就回空 map
+  Map<String, String> get diagnostics;
+
+  /// 重新載入設定 (例如 RFID 時序設定檔)；實作不支援時什麼都不做
+  Future<void> reloadSettings();
   
   /// Dispose of all readers and clean up resources
   @override

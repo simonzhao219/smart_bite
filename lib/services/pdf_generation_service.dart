@@ -111,7 +111,7 @@ class PDFGenerationService {
             'Failed to generate any pages for combined PDF');
       }
 
-      return pdf.save();
+      return await pdf.save();
     } catch (e) {
       throw PDFGenerationException(
           'Failed to generate combined PDF: ${e.toString()}');
@@ -165,7 +165,7 @@ class PDFGenerationService {
           },
         ),
       );
-      return pdf.save();
+      return await pdf.save();
     } catch (e) {
       throw PDFGenerationException(
           'Failed to generate report PDF: ${e.toString()}');
@@ -845,7 +845,7 @@ class PDFGenerationService {
           },
         ),
       );
-      return pdf.save();
+      return await pdf.save();
     } catch (e) {
       throw PDFGenerationException(
           'Failed to generate label PDF: ${e.toString()}');
@@ -1102,7 +1102,7 @@ class PDFGenerationService {
         );
       }
 
-      return pdf.save();
+      return await pdf.save();
     } catch (e) {
       throw PDFGenerationException(
           'Failed to generate test PDF: ${e.toString()}');

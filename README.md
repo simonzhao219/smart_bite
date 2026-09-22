@@ -79,6 +79,67 @@ lib/
 - **Target**: Raspberry Pi (Linux ARM) with GPIO/SPI support
 - **UI Framework**: Flutter with Material Design
 
+## 🚀 Build、Release 與 RPi4 安裝
+
+### CI 流程 (GitHub Actions)
+
+| Workflow | 觸發 | 內容 |
+|----------|------|------|
+| `.github/workflows/ci.yml` | push 到 `main`、所有 PR | x64 上跑 `flutter analyze --no-fatal-infos` 與 `flutter test` |
+| `.github/workflows/release.yml` | push tag `v*`，或手動 Run workflow | 在 GitHub 託管的 ARM64 runner (`ubuntu-24.04-arm`) 上、於 `debian:bookworm` 容器內 `flutter build linux --release` (linux-arm64)，打包成 `smart_bite-linux-arm64.tar.gz` 並建立 GitHub Release |
+
+為什麼在 Debian 12 容器裡 build：Raspberry Pi OS Bookworm 的 glibc 是 2.36，直接在 Ubuntu 24.04 build 出的執行檔會要求更新的 glibc 而無法啟動。容器與 Pi 用同一版 Debian 就不會有這個問題；產物在更新的 Trixie 上也能執行。
+
+### 發佈新版本
+
+```bash
+git tag v1.0.0            # tag 必須以 v 開頭
+git push origin v1.0.0
+```
+
+約 10 到 15 分鐘後，GitHub Release 頁面會有：
+
+- `smart_bite-linux-arm64.tar.gz`：RPi4 執行檔 bundle (內含 `VERSION` 檔)
+- `smart_bite-linux-arm64.tar.gz.sha256`：校驗碼
+- `install.sh`：安裝腳本
+
+Tag 含 `-` (例如 `v1.1.0-rc1`) 會標成 pre-release，`latest` 不會指向它。只想試 build 不發佈：Actions → Release → Run workflow，產物會放在該次 workflow 的 Artifacts。
+
+### 在 RPi4 安裝 (curl 一行)
+
+需求：Raspberry Pi 4、Raspberry Pi OS **64-bit** Bookworm (Debian 12) 或更新版、桌面環境、SPI 已開啟 (`sudo raspi-config nonint do_spi 0` 後重開機)。
+
+```bash
+# 安裝最新版到 /opt/smart_bite，並建立 /usr/local/bin/smart_bite
+curl -fsSL https://raw.githubusercontent.com/simonzhao219/smart_bite/main/scripts/install.sh | sudo bash
+
+# 指定安裝位置與版本
+curl -fsSL https://raw.githubusercontent.com/simonzhao219/smart_bite/main/scripts/install.sh \
+  | sudo bash -s -- --dir /home/pi/smart_bite --version v1.0.0
+```
+
+腳本會依序：下載該 release 的 tar.gz 並驗證 sha256 → 解壓到安裝目錄 (舊版整個換掉；使用者資料放在 `~/Documents`，不受影響) → `apt-get install` 執行期需要的 GTK/EGL 函式庫 → 建立 `/usr/local/bin/smart_bite` → 檢查 SPI 與 `spi`/`gpio` 群組並提示。其他選項：`--no-deps`、`--no-launcher`、`--from-file 本機.tar.gz`、`--repo`、`-h`。
+
+執行與更新：
+
+```bash
+smart_bite                    # 或 /opt/smart_bite/smart_bite，會全螢幕啟動
+RFID_MODE=mock smart_bite     # 沒接 RC522 時改用 mock 讀卡機
+# 更新：再跑一次同一行 curl 指令
+```
+
+### 本機 build 與版本鎖定
+
+- Flutter 版本鎖在兩個 workflow 的 `FLUTTER_VERSION` (目前 3.47.5)，本機建議用同版本；升級時兩個檔案一起改。
+- `pubspec.lock` 與 `linux/` runner 專案 (Flutter 3.47 範本) 都已納入版控，CI 用 `flutter pub get --enforce-lockfile` 確保和本機一致。
+- 手動 build 與打包 (在 Pi 上或任何 Linux)：
+
+  ```bash
+  flutter build linux --release
+  scripts/package_linux.sh arm64 1.0.0                          # x64 機器改用 x64
+  sudo scripts/install.sh --from-file dist/smart_bite-linux-arm64.tar.gz
+  ```
+
 ## 🎨 Design Patterns
 
 ### **1. Provider Pattern (State Management)**

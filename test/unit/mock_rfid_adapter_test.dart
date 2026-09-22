@@ -108,14 +108,18 @@ void main() {
       expect(manager.readers, isNotEmpty);
     }, skip: 'Mock adapter error scenario needs implementation');
 
-    test('empty scenario should return no readers', () async {
+    test('empty scenario should discover no readers and scan no cards',
+        () async {
       final manager = MockRFIDReaderManager(scenario: 'empty');
 
       await manager.discoverReaders();
       expect(manager.readers.length, 0);
 
+      // scanAll() pads the list to 7 readers (like the GPIO adapter), so the
+      // empty scenario yields 7 readings, none of which has a card.
       final readings = await manager.scanAll();
-      expect(readings.length, 0);
+      expect(readings.length, 7);
+      expect(readings.any((r) => r.hasCard), isFalse);
     });
 
     test('should provide valid readings accessor', () async {

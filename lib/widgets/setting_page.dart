@@ -181,6 +181,13 @@ class SettingPage extends StatelessWidget {
 
             const SizedBox(height: 16),
 
+            // 多顆讀到同一張卡：幾乎都是某顆 RST 沒拉低 (七顆共用 SPI bus)，
+            // 訂單頁已經只算一次，這裡要明確提醒檢查接線
+            if (provider.duplicateReaderIds.isNotEmpty) ...[
+              _DuplicateReadersBanner(provider: provider),
+              const SizedBox(height: 12),
+            ],
+
             // Reader cards
             Expanded(
               child: SingleChildScrollView(
@@ -205,6 +212,7 @@ class SettingPage extends StatelessWidget {
                         dishName: dishName,
                         // 只顯示錯誤訊息；工程師用的摘要在時序卡片的「詳細診斷」
                         detail: reading?.errorMessage,
+                        duplicateOf: provider.duplicateOf(reader.deviceId),
                       ),
                     );
                   }).toList(),
@@ -234,8 +242,12 @@ class SettingPage extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: [
           _StatItem(
-            label: '總計',
-            value: provider.readerCount.toString(),
+            label: provider.enabledReaderCount == provider.readerCount
+                ? '總計'
+                : '啟用/總計',
+            value: provider.enabledReaderCount == provider.readerCount
+                ? provider.readerCount.toString()
+                : '${provider.enabledReaderCount}/${provider.readerCount}',
             icon: Icons.devices,
           ),
           _StatItem(
@@ -592,7 +604,11 @@ class _ReaderStatusRow extends StatelessWidget {
     required this.rfidId,
     this.dishName,
     this.detail,
+    this.duplicateOf,
   });
+
+  /// 這顆讀到的卡片跟編號更小的那顆一樣，已被忽略；值是本尊的 deviceId
+  final String? duplicateOf;
 
   @override
   Widget build(BuildContext context) {
@@ -677,19 +693,21 @@ class _ReaderStatusRow extends StatelessWidget {
   }
 
   Widget _buildCardDetectedInfo(BuildContext context) {
+    final duplicate = duplicateOf != null;
+    final MaterialColor tone = duplicate ? Colors.orange : Colors.green;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.green[50],
+        color: tone[50],
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.green[200]!, width: 1.5),
+        border: Border.all(color: tone[200]!, width: 1.5),
       ),
       child: Row(
         children: [
           // RFID Icon
           Icon(
-            Icons.credit_card,
-            color: Colors.green[700],
+            duplicate ? Icons.warning_amber : Icons.credit_card,
+            color: tone[700],
             size: 24,
           ),
           const SizedBox(width: 12),
@@ -743,6 +761,16 @@ class _ReaderStatusRow extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
+                if (duplicate)
+                  Text(
+                    '與讀卡機 $duplicateOf 是同一張卡，已忽略。'
+                    '請檢查這顆的 RST 接線 (鬆脫、接錯腳或常態高電位)。',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Colors.orange[900],
+                        ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
               ],
             ),
           ),
@@ -753,6 +781,23 @@ class _ReaderStatusRow extends StatelessWidget {
 
   Widget _buildNoCardInfo(BuildContext context) {
     final isError = status == ReaderStatus.error;
+    final isDisabled = status == ReaderStatus.disabled;
+    final IconData icon;
+    if (isError) {
+      icon = Icons.link_off;
+    } else if (isDisabled) {
+      icon = Icons.power_settings_new;
+    } else {
+      icon = Icons.credit_card_off;
+    }
+    final String text;
+    if (isError) {
+      text = '線路異常，請檢查接線';
+    } else if (isDisabled) {
+      text = '未啟用：設定裡沒有勾選這顆，輪巡時略過 (RST 仍拉低)';
+    } else {
+      text = '未偵測到卡片';
+    }
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -765,7 +810,7 @@ class _ReaderStatusRow extends StatelessWidget {
       child: Row(
         children: [
           Icon(
-            isError ? Icons.link_off : Icons.credit_card_off,
+            icon,
             size: 24,
             color: isError ? Colors.red[700] : Colors.grey[500],
           ),
@@ -775,7 +820,7 @@ class _ReaderStatusRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  isError ? '線路異常，請檢查接線' : '未偵測到卡片',
+                  text,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: isError ? Colors.red[900] : Colors.grey[600],
                         fontWeight: isError ? FontWeight.w600 : null,
@@ -810,6 +855,8 @@ class _ReaderStatusRow extends StatelessWidget {
         return Icons.radio_button_unchecked;
       case ReaderStatus.disconnected:
         return Icons.cloud_off;
+      case ReaderStatus.disabled:
+        return Icons.power_settings_new;
     }
   }
 
@@ -830,6 +877,46 @@ class _ReaderStatusRow extends StatelessWidget {
       return 'GPIO';
     }
     return address;
+  }
+}
+
+/// 多顆讀卡機讀到同一張卡的提醒 (訂單頁已只算一次，這裡提示檢查接線)
+class _DuplicateReadersBanner extends StatelessWidget {
+  final RFIDReaderProvider provider;
+
+  const _DuplicateReadersBanner({required this.provider});
+
+  @override
+  Widget build(BuildContext context) {
+    final pairs = provider.duplicateReaderIds
+        .map((id) => '$id (同 ${provider.duplicateOf(id)})')
+        .join('、');
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.orange[50],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.orange[300]!),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.warning_amber, color: Colors.orange[800]),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              '讀卡機 $pairs 讀到與別顆相同的卡片，已只算一次。'
+              '一張卡不會同時在兩個感應區，通常是這幾顆的 RST 沒有被拉低 '
+              '(接線鬆脫、接錯腳或接到 3.3V)，醒著的晶片會回應每一個位置。'
+              '只接了部分讀卡機時，請在「編輯設定」把沒接的取消勾選。',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Colors.orange[900],
+                  ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 

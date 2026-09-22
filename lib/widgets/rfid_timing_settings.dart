@@ -39,15 +39,18 @@ class RfidTimingSettingsCard extends StatelessWidget {
       final overrides = config.hasReaderOverrides
           ? '，${config.overriddenReaderIds.length} 顆有個別覆寫'
           : '';
-      summary = 'SPI ${config.spiSpeedHz} Hz，RST 後 ${config.rstSettleMs} ms，'
-          '天線後 ${config.antennaSettleMs} ms，'
+      final enabled =
+          config.allReadersEnabled ? '' : '只啟用 ${config.enabledReadersText}；';
+      summary = '${enabled}SPI ${config.spiSpeedHz} Hz，'
+          'RST 後 ${config.rstSettleMs} ms，天線後 ${config.antennaSettleMs} ms，'
           'REQA ${config.reqaTimeoutMs} ms × ${config.reqaAttempts} 次$overrides';
     }
 
     String? estimate;
-    if (config != null && deviceIds.isNotEmpty) {
-      estimate = '估計一輪：全部沒卡約 ${config.estimateNoCardScanMsFor(deviceIds)} ms，'
-          '七顆都有卡約 ${config.estimateAllCardsScanMsFor(deviceIds)} ms'
+    final enabledIds = config?.enabledDeviceIds(deviceIds) ?? deviceIds;
+    if (config != null && enabledIds.isNotEmpty) {
+      estimate = '估計一輪：全部沒卡約 ${config.estimateNoCardScanMsFor(enabledIds)} ms，'
+          '啟用的都有卡約 ${config.estimateAllCardsScanMsFor(enabledIds)} ms'
           '${scanMs != null ? '，上次實測 $scanMs ms' : ''}';
     } else if (scanMs != null) {
       estimate = '上次掃描耗時 $scanMs ms';
@@ -222,6 +225,12 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
   late Map<String, int> _values;
   late int _spiSpeedHz;
   late Map<String, Map<String, int>> _overrides;
+
+  /// 接線表上所有讀卡機的編號 (1 起算)，勾選框用
+  late final List<int> _allReaderNumbers;
+
+  /// 目前勾選啟用的讀卡機編號；全部勾選時存成空清單 (代表全部)
+  late Set<int> _enabledReaders;
   bool _saving = false;
   String? _error;
 
@@ -238,6 +247,19 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
       for (final entry in widget.initial.readerOverrides.entries)
         entry.key: Map<String, int>.from(entry.value),
     };
+    final numbers = <int>{
+      for (final reader in widget.provider.readers)
+        if (int.tryParse(reader.deviceId) != null) int.parse(reader.deviceId),
+      // 設定檔裡列了接線表上沒有的編號也顯示出來，儲存時才不會被默默丟掉
+      ...widget.initial.enabledReaders,
+    };
+    _allReaderNumbers = (numbers.isEmpty
+        ? List<int>.generate(7, (index) => index + 1)
+        : numbers.toList())
+      ..sort();
+    _enabledReaders = widget.initial.enabledReaders.isEmpty
+        ? {..._allReaderNumbers}
+        : {...widget.initial.enabledReaders};
   }
 
   void _resetToDefaults() {
@@ -248,17 +270,26 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
       }
       _spiSpeedHz = RfidTimingConfig.defaults.spiSpeedHz;
       _overrides = {};
+      _enabledReaders = {..._allReaderNumbers};
       _error = null;
     });
   }
 
+  bool get _allEnabled => _allReaderNumbers.every(_enabledReaders.contains);
+
   RfidTimingConfig _buildConfig() {
     final json = <String, dynamic>{'spiSpeedHz': _spiSpeedHz, ..._values};
     json[RfidTimingConfig.readersKey] = _overrides;
+    json[RfidTimingConfig.enabledReadersKey] =
+        _allEnabled ? const <int>[] : (_enabledReaders.toList()..sort());
     return RfidTimingConfig.fromJson(json).validated();
   }
 
   Future<void> _save() async {
+    if (_enabledReaders.isEmpty) {
+      setState(() => _error = '至少要啟用一顆讀卡機');
+      return;
+    }
     setState(() {
       _saving = true;
       _error = null;
@@ -345,6 +376,48 @@ class _TimingEditDialogState extends State<_TimingEditDialog> {
                     ),
                 ],
               ),
+              const SizedBox(height: 16),
+              Text(
+                RfidTimingConfig.enabledReadersLabel,
+                style:
+                    textTheme.titleSmall?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '${RfidTimingConfig.enabledReadersHint}'
+                '七顆共用 SPI bus，一顆 RST 沒拉低的模組會讓每個位置都讀到同一張卡。',
+                style: textTheme.bodySmall?.copyWith(color: Colors.grey[700]),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final number in _allReaderNumbers)
+                    FilterChip(
+                      label: Text('讀卡機 ${number.toString().padLeft(2, '0')}'),
+                      selected: _enabledReaders.contains(number),
+                      onSelected: _saving
+                          ? null
+                          : (selected) => setState(() {
+                                if (selected) {
+                                  _enabledReaders.add(number);
+                                } else {
+                                  _enabledReaders.remove(number);
+                                }
+                                if (_enabledReaders.isNotEmpty) _error = null;
+                              }),
+                    ),
+                ],
+              ),
+              if (_enabledReaders.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(top: 4),
+                  child: Text(
+                    '至少要啟用一顆讀卡機',
+                    style: TextStyle(color: Colors.red),
+                  ),
+                ),
               const SizedBox(height: 16),
               Row(
                 children: [
@@ -836,8 +909,10 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
   /// 用一半算；不含往上放寬的情況
   int get _estimatedSeconds {
     final options = _options.validated();
-    final ids = widget.provider.readers.map((r) => r.deviceId).toList();
     final config = widget.provider.timing;
+    final ids = config.enabledDeviceIds(
+      widget.provider.readers.map((r) => r.deviceId),
+    );
     final perRoundMs = ids.isEmpty
         ? config.estimateAllCardsScanMsFor(const ['01'])
         : config.estimateAllCardsScanMsFor(ids);
@@ -945,9 +1020,10 @@ class _OptimizeDialogState extends State<_OptimizeDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                '請先在七個感應器都放上卡片，再按「開始」。',
-                style: TextStyle(fontWeight: FontWeight.w600),
+              Text(
+                '請先在啟用的 ${widget.provider.enabledReaderCount} 個感應器都放上卡片，'
+                '再按「開始」。',
+                style: const TextStyle(fontWeight: FontWeight.w600),
               ),
               const SizedBox(height: 8),
               Text(

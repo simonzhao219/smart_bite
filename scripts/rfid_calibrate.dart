@@ -15,7 +15,8 @@
 ///   --file <path>   設定檔路徑。預設看 RFID_TIMING_FILE 環境變數，再來是 ~/Documents/rfid_timing.json
 ///                   (跟 app 用同一個函式決定，兩邊讀寫同一個檔案)
 ///   --readers 1,2,7 只測某幾顆 (link / bench / sweep / optimize 都支援)；
-///                   沒選到的讀卡機 RST 仍會拉低，bus 上不會有別顆醒著
+///                   沒選到的讀卡機 RST 仍會拉低，bus 上不會有別顆醒著。
+///                   沒給時，設定檔的 enabledReaders 有值就只測那幾顆
 ///   --verbose       顯示每顆讀卡機的細節
 ///
 /// 說明文件：documents/RFID_TIMING_TUNING.md
@@ -105,7 +106,7 @@ Future<void> _bench(_Options options) async {
   final load = await _loadTiming(options);
   _printTiming(load);
   print('');
-  final configs = _selectedConfigs(options);
+  final configs = _selectedConfigs(options, load.config);
   print('▶ 以目前設定跑 ${options.rounds} 輪完整掃描 (${configs.length} 顆)');
   final service = RFIDPollingService(
     timing: load.config,
@@ -127,7 +128,7 @@ Future<void> _sweep(_Options options) async {
   final base = load.config;
   final rstList = options.rst ?? [base.rstSettleMs];
   final antennaList = options.antenna ?? [base.antennaSettleMs];
-  final configs = _selectedConfigs(options);
+  final configs = _selectedConfigs(options, base);
 
   _printTiming(load);
   print('');
@@ -219,7 +220,7 @@ Future<void> _optimize(_Options options) async {
   final load = await _loadTiming(options);
   _printTiming(load);
   print('');
-  final configs = _selectedConfigs(options);
+  final configs = _selectedConfigs(options, load.config);
   print('▶ 自動最佳化：請先在要測的 ${configs.length} 個感應器都放上卡片。');
   if (stdin.hasTerminal) {
     stdout.write('放好後按 Enter 開始 (Ctrl+C 取消)… ');
@@ -347,6 +348,7 @@ Future<void> _set(_Options options) async {
     print('用法: set key=value [01.key=value ...] [01.clear] [clear]');
     print('全域欄位: ${RfidTimingConfig.keys.join(', ')}');
     print('可對單顆覆寫的欄位: ${RfidTimingConfig.perReaderKeys.join(', ')}');
+    print('啟用清單: enabledReaders=1,2 或 enabledReaders=all');
     exit(1);
   }
 
@@ -368,6 +370,20 @@ Future<void> _set(_Options options) async {
       throw ArgumentError('格式錯誤: $assignment (應為 key=value 或 01.key=value)');
     }
     var key = parts[0].trim();
+    if (key == RfidTimingConfig.enabledReadersKey) {
+      // 啟用清單：enabledReaders=1,2 或 enabledReaders=all
+      final raw = parts[1].trim();
+      final numbers = raw == 'all'
+          ? const <int>[]
+          : RfidTimingConfig.parseReaderNumbers(raw);
+      if (numbers == null) {
+        throw ArgumentError(
+          'enabledReaders 要是逗號分隔的讀卡機編號或 all: $assignment',
+        );
+      }
+      config = config.copyWith(enabledReaders: numbers);
+      continue;
+    }
     final value = RfidTimingConfig.parseIntValue(parts[1]);
     if (value == null) {
       throw ArgumentError('不是整數: $assignment');
@@ -475,15 +491,26 @@ void _printTiming(RfidTimingLoadResult load) {
     print('  讀卡機 $id 覆寫: '
         '${values.entries.map((e) => '${e.key}=${e.value}').join(', ')}');
   }
-  print('  估計無卡一輪約 '
-      '${load.config.estimateNoCardScanMs(defaultReaderConfigs.length)} ms');
+  final enabledCount = load.config
+      .enabledDeviceIds(defaultReaderConfigs.map((c) => c.deviceId))
+      .length;
+  print('  ${RfidTimingConfig.enabledReadersLabel}: '
+      '${load.config.enabledReadersText}');
+  print('  估計無卡一輪約 ${load.config.estimateNoCardScanMs(enabledCount)} ms');
 }
 
-List<ReaderConfig> _selectedConfigs(_Options options) {
-  final selected = options.readers;
-  if (selected == null || selected.isEmpty) return defaultReaderConfigs;
+/// 要測的讀卡機：`--readers` 優先，沒給時看設定檔的 `enabledReaders`，再沒有就是全部。
+/// 沒選到的讀卡機由呼叫端用 [_parkUnselected] 把 RST 拉低。
+List<ReaderConfig> _selectedConfigs(_Options options, RfidTimingConfig config) {
+  var selected = options.readers;
+  if (selected == null || selected.isEmpty) {
+    if (config.allReadersEnabled) return defaultReaderConfigs;
+    selected = config.enabledReaders;
+    print('  設定檔只啟用讀卡機 ${config.enabledReadersText}，其餘 RST 拉低不測'
+        ' (要測全部請加 --readers 1,2,3,4,5,6,7)');
+  }
   final configs = defaultReaderConfigs
-      .where((config) => selected.contains(config.deviceNum))
+      .where((config) => selected!.contains(config.deviceNum))
       .toList();
   if (configs.isEmpty) {
     throw ArgumentError('沒有符合的讀卡機編號: $selected');
@@ -496,7 +523,7 @@ Future<List<LinkMeasurement>> _measureLinks(
   _Options options,
   RfidTimingConfig timing,
 ) async {
-  final configs = _selectedConfigs(options);
+  final configs = _selectedConfigs(options, timing);
   final measurements = <LinkMeasurement>[];
   final lines = <int, GpioResetLine>{};
 
@@ -734,10 +761,12 @@ RC522 輪巡校正工具 (請先關閉 Smart Bite app 再執行)
   set key=value ...        直接修改設定檔，例如 set rstSettleMs=20 antennaSettleMs=5
                            單顆覆寫: set 07.rstSettleMs=30 07.antennaSettleMs=10 (7. 也可以)
                            清除覆寫: set 07.clear 或 set clear
+                           只接了部分讀卡機: set enabledReaders=1,2 (全部: set enabledReaders=all)
 
 共同選項:
   --file <path>            設定檔路徑 (預設: \$RFID_TIMING_FILE 或 ~/Documents/rfid_timing.json，跟 app 相同)
-  --readers 1,2,7          只測某幾顆 (link / bench / sweep / optimize)，其餘 RST 仍拉低
+  --readers 1,2,7          只測某幾顆 (link / bench / sweep / optimize)，其餘 RST 仍拉低；
+                           沒給時，設定檔的 enabledReaders 有值就只測那幾顆
   --verbose, -v            顯示細節
   --help, -h               顯示這份說明
 

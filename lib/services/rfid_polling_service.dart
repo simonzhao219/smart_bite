@@ -10,6 +10,10 @@
 /// (校正與最佳化用)；[RFIDPollingService.performOneLoopCycles] 則是
 /// 開一次、掃一輪、關掉，給 app 的按鈕觸發掃描用。
 ///
+/// 兩者都可以只讀一部分讀卡機 (`activeDeviceIds`，對應設定裡的 `enabledReaders`)：
+/// 沒選到的讀卡機不讀，但 RST 一樣打開並拉低。bus 是七顆共用的，
+/// 一顆沒被拉低的 RC522 會醒著回應每一個位置的讀取，七個位置就會讀到同一張卡。
+///
 /// 舊版每顆固定睡 500 ms 三次 (init 後、reset 後、dispose 時)，
 /// 七顆一輪約 12 秒；新版的等待值全部來自 [RfidTimingConfig]，
 /// 而且每顆可以有自己的覆寫值 ([RfidTimingConfig.forReader])。
@@ -77,6 +81,9 @@ class RfidScanSession {
   final RfidTimingConfig timing;
   final RfidLog? log;
 
+  /// 只讀這些 deviceId；null 代表 [configs] 全部。沒選到的讀卡機 RST 仍會拉低。
+  final Set<String>? activeDeviceIds;
+
   final Map<int, SPI> _buses = {};
   final List<GpioResetLine> _lines = [];
   final List<SimpleMFRC522> _readers = [];
@@ -86,11 +93,23 @@ class RfidScanSession {
     this.configs, {
     RfidTimingConfig? timing,
     this.log,
-  }) : timing = (timing ?? RfidTimingConfig.defaults).validated();
+    Set<String>? activeDeviceIds,
+  })  : timing = (timing ?? RfidTimingConfig.defaults).validated(),
+        activeDeviceIds = activeDeviceIds == null
+            ? null
+            : Set<String>.unmodifiable(activeDeviceIds);
 
   bool get isOpen => _isOpen;
 
-  List<String> get deviceIds => configs.map((c) => c.deviceId).toList();
+  /// 這顆讀卡機是否會被讀取 (RST 不論如何都會打開並拉低)
+  bool isActive(String deviceId) =>
+      activeDeviceIds == null || activeDeviceIds!.contains(deviceId);
+
+  /// 會被讀取的讀卡機，依 [configs] 的順序
+  List<String> get deviceIds => [
+        for (final config in configs)
+          if (isActive(config.deviceId)) config.deviceId,
+      ];
 
   /// 開啟所有 RST (全部拉低) 與 SPI bus。已開啟時不做事。
   ///
@@ -115,6 +134,9 @@ class RfidScanSession {
         }
         _lines.add(line);
 
+        // 沒啟用的讀卡機只需要 RST 拉低，不建讀卡物件、不掃
+        if (!isActive(config.deviceId)) continue;
+
         final spi = _buses.putIfAbsent(
           config.spiNum,
           () => SPI(config.spiNum, 0, SPImode.mode0, timing.spiSpeedHz),
@@ -133,7 +155,7 @@ class RfidScanSession {
     }
   }
 
-  /// 對每一顆各讀一次。[timing] 不給就用 session 的設定。
+  /// 對每一顆啟用的讀卡機各讀一次。[timing] 不給就用 session 的設定。
   Future<ScanCycleResult> scanCycle({RfidTimingConfig? timing}) async {
     if (!_isOpen) open();
     final effective = (timing ?? this.timing).validated();
@@ -222,11 +244,18 @@ class RFIDPollingService {
   RFIDPollingService({RfidTimingConfig? timing, this.log})
       : timing = (timing ?? RfidTimingConfig.defaults).validated();
 
-  /// 對 [configs] 的每一顆各讀一次：開啟 session、掃一輪、關閉
+  /// 對 [configs] 的每一顆各讀一次：開啟 session、掃一輪、關閉。
+  /// [activeDeviceIds] 不為 null 時只讀那幾顆，其餘 RST 仍拉低。
   Future<ScanCycleResult> performOneLoopCycles(
-    List<ReaderConfig> configs,
-  ) async {
-    final session = RfidScanSession(configs, timing: timing, log: log);
+    List<ReaderConfig> configs, {
+    Set<String>? activeDeviceIds,
+  }) async {
+    final session = RfidScanSession(
+      configs,
+      timing: timing,
+      log: log,
+      activeDeviceIds: activeDeviceIds,
+    );
     try {
       session.open();
       final cycle = await session.scanCycle();

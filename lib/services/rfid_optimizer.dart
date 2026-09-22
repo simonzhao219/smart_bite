@@ -89,16 +89,25 @@ class HardwareOptimizerRunner implements RfidOptimizerRunner {
   final List<ReaderConfig> configs;
   final RfidTimingConfig base;
   final RfidLog? log;
+
+  /// 只最佳化這些讀卡機 (null 代表 [configs] 全部)；其餘的 RST 仍拉低
+  final Set<String>? activeDeviceIds;
   RfidScanSession? _session;
 
   HardwareOptimizerRunner({
     required this.configs,
     required this.base,
     this.log,
+    this.activeDeviceIds,
   });
 
   @override
-  List<String> get deviceIds => configs.map((c) => c.deviceId).toList();
+  List<String> get deviceIds => [
+        for (final config in configs)
+          if (activeDeviceIds == null ||
+              activeDeviceIds!.contains(config.deviceId))
+            config.deviceId,
+      ];
 
   @override
   Future<List<LinkProbeResult>> probeLinks(
@@ -110,6 +119,7 @@ class HardwareOptimizerRunner implements RfidOptimizerRunner {
       configs,
       timing: base.copyWith(spiSpeedHz: spiSpeedHz),
       log: log,
+      activeDeviceIds: activeDeviceIds,
     );
     try {
       session.open();
@@ -126,6 +136,7 @@ class HardwareOptimizerRunner implements RfidOptimizerRunner {
       configs,
       timing: base.copyWith(spiSpeedHz: spiSpeedHz),
       log: log,
+      activeDeviceIds: activeDeviceIds,
     )..open();
   }
 

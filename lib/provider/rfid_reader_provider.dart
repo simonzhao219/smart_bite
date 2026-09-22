@@ -12,6 +12,10 @@
 /// - [startPolling] / [stopPolling]：持續背景輪巡，每輪結果做「黏性合併」
 ///   (見 [RfidTimingConfig.stickyRounds])，托盤晚放、中途換餐、偶發漏讀都不用客人按鈕。
 ///   訂單頁顯示的是合併後的狀態；「線路異常」只在連續 [linkErrorRounds] 輪都異常時才算。
+///
+/// 同一張卡不可能同時在兩顆讀卡機上：同一輪裡多顆讀到相同 UID，幾乎都是某顆的 RST
+/// 沒被拉低、醒著回應每一個位置 (七顆共用 SPI bus)。這種「重複」只算一次
+/// (保留編號最小的那顆)，其餘標成 [duplicateReaderIds]，設定頁會提示檢查接線。
 library;
 
 import 'dart:async';
@@ -53,6 +57,9 @@ class RFIDReaderProvider extends ChangeNotifier {
 
   /// 目前對外顯示為線路異常的讀卡機
   final Set<String> _errorIds = {};
+
+  /// 讀到與編號更小那顆相同 UID 的讀卡機：deviceId → 被視為本尊的 deviceId
+  final Map<String, String> _duplicateOf = {};
 
   bool _polling = false;
   Future<void>? _pollLoop;
@@ -114,6 +121,29 @@ class RFIDReaderProvider extends ChangeNotifier {
   /// 對外顯示為線路異常的讀卡機 deviceId。
   /// 單次掃描：這一次異常就算；背景輪巡：連續 [linkErrorRounds] 輪異常才算。
   List<String> get errorReaderIds => _errorIds.toList()..sort();
+
+  /// 讀到與編號更小那顆相同卡片、被忽略的讀卡機 deviceId (已排序)。
+  /// 不為空幾乎都代表某顆的 RST 接線有問題 (見檔頭說明)。
+  List<String> get duplicateReaderIds => _duplicateOf.keys.toList()..sort();
+
+  /// 這顆讀卡機的卡片是否只是別顆的重複；是的話回傳被當成本尊的 deviceId
+  String? duplicateOf(String deviceId) => _duplicateOf[deviceId];
+
+  bool isDuplicate(String deviceId) => _duplicateOf.containsKey(deviceId);
+
+  /// 設定裡有啟用 (會被掃描) 的讀卡機數量
+  int get enabledReaderCount =>
+      readers.where((r) => r.status != ReaderStatus.disabled).length;
+
+  /// 合併後、去掉重複卡片的讀取結果，依讀卡機編號排序。
+  /// 訂單、統計與營養分析都以這份為準。
+  List<RFIDReading> get effectiveReadings {
+    final ids = _merged.keys.toList()..sort();
+    return [
+      for (final id in ids)
+        if (!_duplicateOf.containsKey(id)) _merged[id]!,
+    ];
+  }
 
   /// 是否支援時序設定、連線檢測與自動最佳化
   bool get supportsCalibration => _readerManager.supportsCalibration;
@@ -231,8 +261,8 @@ class RFIDReaderProvider extends ChangeNotifier {
       }
       _replaceState(readings);
 
-      // Identify meals from valid readings
-      _orderNames = _mealService.identifyMealsFromReadings(readings);
+      // Identify meals from valid readings (重複的卡片只算一次)
+      _orderNames = _mealService.identifyMealsFromReadings(effectiveReadings);
 
       // Enhanced logging for analytics - distinguish different empty scenarios
       if (_orderNames.isEmpty) {
@@ -309,7 +339,7 @@ class RFIDReaderProvider extends ChangeNotifier {
   Future<void> waitForFirstRound({Duration? timeout}) async {
     final first = _firstRound;
     if (first == null || first.isCompleted) return;
-    final limit = timeout ?? timing.scanTimeoutFor(readerCount);
+    final limit = timeout ?? timing.scanTimeoutFor(enabledReaderCount);
     await first.future.timeout(limit, onTimeout: () {});
   }
 
@@ -364,6 +394,32 @@ class RFIDReaderProvider extends ChangeNotifier {
       _merged[reading.deviceId] = reading;
       if (reading.status == ReaderStatus.error) _errorIds.add(reading.deviceId);
     }
+    _recomputeDuplicates();
+  }
+
+  /// 同一張卡 (相同 UID) 出現在多顆讀卡機上時，只有編號最小的那顆算數。
+  /// 一張卡不可能同時在兩個感應區；多顆讀到同一張幾乎都是某顆 RST 沒拉低、
+  /// 醒著回應每一個位置。重複的讀卡機記在 [_duplicateOf]，變動時寫一筆 log。
+  void _recomputeDuplicates() {
+    final before = duplicateReaderIds.join(',');
+    _duplicateOf.clear();
+    final ids = _merged.keys.toList()..sort();
+    final firstSeen = <String, String>{};
+    for (final id in ids) {
+      final reading = _merged[id]!;
+      if (!reading.hasCard) continue;
+      final original = firstSeen[reading.rfid];
+      if (original == null) {
+        firstSeen[reading.rfid] = id;
+      } else {
+        _duplicateOf[id] = original;
+      }
+    }
+    final after = duplicateReaderIds.join(',');
+    if (after != before && after.isNotEmpty) {
+      debugPrint('⚠ 讀卡機 $after 讀到與編號更小那顆相同的卡片，已忽略；'
+          '請檢查這幾顆的 RST 接線 (沒拉低的 RC522 會回應每一個位置)');
+    }
   }
 
   /// 背景輪巡：黏性合併。
@@ -401,8 +457,8 @@ class RFIDReaderProvider extends ChangeNotifier {
         _errorIds.remove(id);
       }
     }
-    _orderNames =
-        _mealService.identifyMealsFromReadings(_merged.values.toList());
+    _recomputeDuplicates();
+    _orderNames = _mealService.identifyMealsFromReadings(effectiveReadings);
     final after = _orderNames.join(',');
     if (after != before) {
       debugPrint('Background poll round $_round: meals [$after]');
@@ -420,19 +476,13 @@ class RFIDReaderProvider extends ChangeNotifier {
     }
   }
 
-  /// Get all (merged) readings with valid cards
+  /// Get all (merged) readings with valid cards (重複的卡片已去掉)
   List<RFIDReading> get validReadings =>
-      _merged.values.where((reading) => reading.hasCard).toList();
+      effectiveReadings.where((reading) => reading.hasCard).toList();
 
-  /// Get statistics about last scan
-  Map<String, int> getStats() {
-    final allReadings = readers
-        .map((r) => getReading(r.deviceId))
-        .whereType<RFIDReading>()
-        .toList();
-
-    return _mealService.getIdentificationStats(allReadings);
-  }
+  /// Get statistics about last scan (重複的卡片已去掉)
+  Map<String, int> getStats() =>
+      _mealService.getIdentificationStats(effectiveReadings);
 
   /// Get reader status summary
   Map<String, int> getReaderStatusSummary() {
@@ -442,6 +492,7 @@ class RFIDReaderProvider extends ChangeNotifier {
       'ok': 0,
       'error': 0,
       'disconnected': 0,
+      'disabled': 0,
     };
 
     for (final reader in readers) {
@@ -452,9 +503,11 @@ class RFIDReaderProvider extends ChangeNotifier {
     return statusCounts;
   }
 
-  /// Check if all readers are in OK state
+  /// Check if all enabled readers are in OK state (沒啟用的不算)
   bool get allReadersOk {
-    return readers.every((r) => r.status == ReaderStatus.ok);
+    return readers
+        .where((r) => r.status != ReaderStatus.disabled)
+        .every((r) => r.status == ReaderStatus.ok);
   }
 
   /// Check if any reader has an error
@@ -489,6 +542,8 @@ extension ReaderStatusDisplay on ReaderStatus {
         return '錯誤';
       case ReaderStatus.disconnected:
         return '未連接';
+      case ReaderStatus.disabled:
+        return '未啟用';
     }
   }
 
@@ -505,6 +560,8 @@ extension ReaderStatusDisplay on ReaderStatus {
         return Colors.red;
       case ReaderStatus.disconnected:
         return Colors.orange;
+      case ReaderStatus.disabled:
+        return Colors.blueGrey;
     }
   }
 }

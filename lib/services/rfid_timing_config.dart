@@ -26,6 +26,11 @@
 /// ```
 ///
 /// 自動最佳化會替每顆讀卡機各自找出最小可靠值並寫進 `readers`。
+///
+/// `enabledReaders` 列出實際有接線的讀卡機編號 (1 起算)，空清單代表全部。
+/// 開發時只接一顆、或某顆模組拆掉送修時用得到；沒列進去的讀卡機不會被掃描，
+/// 但它的 RST 一樣會拉低，bus 上才不會有沒人管的晶片醒著。
+/// 環境變數 `RFID_ENABLED_READERS=1,2` 可以覆寫。
 library;
 
 import 'dart:convert';
@@ -94,6 +99,17 @@ class RfidTimingConfig {
   /// 設定檔裡每顆讀卡機覆寫區段的 key
   static const String readersKey = 'readers';
 
+  /// 設定檔裡「啟用的讀卡機」清單的 key
+  static const String enabledReadersKey = 'enabledReaders';
+
+  /// 覆寫啟用清單的環境變數，值是逗號分隔的讀卡機編號，例如 `1,2,7`
+  static const String enabledReadersEnvKey = 'RFID_ENABLED_READERS';
+
+  /// 設定頁與 CLI 顯示用
+  static const String enabledReadersLabel = '啟用的讀卡機';
+  static const String enabledReadersHint = '只掃描實際有接線的讀卡機。沒接的那幾顆關掉之後不會出現在訂單頁，'
+      '也不會被算成線路異常；它們的 RST 仍會拉低。';
+
   /// SPI 時脈 (Hz)。線長、負載重時可降到 500000 或 250000，
   /// 每次傳輸只有 2 bytes，降速對整輪時間影響很小。整條 bus 共用，不能每顆不同。
   final int spiSpeedHz;
@@ -152,6 +168,10 @@ class RfidTimingConfig {
   /// 只允許 [perReaderKeys] 裡的欄位，其他會被忽略。
   final Map<String, Map<String, int>> readerOverrides;
 
+  /// 實際有接線、要掃描的讀卡機編號 (1 起算，已排序去重)。空清單代表全部。
+  /// 沒列進去的讀卡機不掃描、不顯示卡片，但 RST 仍會拉低。
+  final List<int> enabledReaders;
+
   const RfidTimingConfig({
     this.spiSpeedHz = 1000000,
     this.rstSettleMs = 50,
@@ -169,6 +189,7 @@ class RfidTimingConfig {
     this.pollGapMs = 300,
     this.stickyRounds = 3,
     this.readerOverrides = const {},
+    this.enabledReaders = const [],
   });
 
   /// 程式內建預設值。等待值刻意保守 (天線 200 ms、顆間 200 ms、REQA 3 次，
@@ -286,6 +307,28 @@ class RfidTimingConfig {
       .toList()
     ..sort();
 
+  /// 沒有限制啟用清單：所有接線表上的讀卡機都掃
+  bool get allReadersEnabled => enabledReaders.isEmpty;
+
+  /// 這顆讀卡機是否要掃描。deviceId 可以是 "07" 或 "7"；
+  /// 不是數字的 id 只有在沒有限制清單時才算啟用。
+  bool isReaderEnabled(String deviceId) {
+    if (enabledReaders.isEmpty) return true;
+    final number = int.tryParse(deviceId.trim());
+    return number != null && enabledReaders.contains(number);
+  }
+
+  /// 從 [deviceIds] 挑出要掃描的那些，順序不變
+  List<String> enabledDeviceIds(Iterable<String> deviceIds) =>
+      deviceIds.where(isReaderEnabled).toList();
+
+  /// 給人看的啟用清單：「全部」或「01、02」
+  String get enabledReadersText => enabledReaders.isEmpty
+      ? '全部'
+      : enabledReaders
+          .map((number) => number.toString().padLeft(2, '0'))
+          .join('、');
+
   /// 只含全域欄位的 JSON
   Map<String, int> toBaseJson() => {
         'spiSpeedHz': spiSpeedHz,
@@ -305,7 +348,8 @@ class RfidTimingConfig {
         'stickyRounds': stickyRounds,
       };
 
-  /// 全域欄位加上 `readers` 區段 (沒有覆寫時省略)
+  /// 全域欄位加上 `readers` 區段 (沒有覆寫時省略) 與 `enabledReaders`
+  /// (全部啟用時省略)
   Map<String, dynamic> toJson() {
     final json = <String, dynamic>{...toBaseJson()};
     if (hasReaderOverrides) {
@@ -313,6 +357,9 @@ class RfidTimingConfig {
         for (final id in overriddenReaderIds)
           id: Map<String, int>.from(readerOverrides[id]!),
       };
+    }
+    if (enabledReaders.isNotEmpty) {
+      json[enabledReadersKey] = List<int>.from(enabledReaders);
     }
     return json;
   }
@@ -347,6 +394,12 @@ class RfidTimingConfig {
       }
     }
 
+    // 缺少或格式不對 (不是編號清單) 時沿用 base 的清單
+    final rawEnabled = json[enabledReadersKey];
+    final enabled = rawEnabled == null
+        ? base.enabledReaders
+        : (parseReaderNumbers(rawEnabled) ?? base.enabledReaders);
+
     return RfidTimingConfig(
       spiSpeedHz: pick('spiSpeedHz', base.spiSpeedHz),
       rstSettleMs: pick('rstSettleMs', base.rstSettleMs),
@@ -364,7 +417,30 @@ class RfidTimingConfig {
       pollGapMs: pick('pollGapMs', base.pollGapMs),
       stickyRounds: pick('stickyRounds', base.stickyRounds),
       readerOverrides: overrides,
+      enabledReaders: enabled,
     );
+  }
+
+  /// 把讀卡機編號清單正規化：接受 `[1, 2]`、`["01", "7"]` 或 `"1,2,7"`
+  /// (逗號、空白或頓號分隔)，回傳排序去重後的正整數清單。
+  /// 空清單或空字串回 `[]` (代表全部)；有任何一項不是正整數就回 null。
+  static List<int>? parseReaderNumbers(Object? value) {
+    final Iterable<Object?> items;
+    if (value is String) {
+      items =
+          value.split(RegExp(r'[,\s、]+')).where((token) => token.isNotEmpty);
+    } else if (value is Iterable) {
+      items = value;
+    } else {
+      return null;
+    }
+    final numbers = <int>{};
+    for (final item in items) {
+      final number = parseIntValue(item);
+      if (number == null || number < 1) return null;
+      numbers.add(number);
+    }
+    return numbers.toList()..sort();
   }
 
   /// 讀卡機 id 正規化：`7` → `07`。覆寫的 key 是兩位數的 deviceId，
@@ -402,10 +478,13 @@ class RfidTimingConfig {
     return RfidTimingConfig.fromJson(json, base: this);
   }
 
-  /// 某顆讀卡機實際生效的設定：全域值套上該顆的覆寫，結果不再帶 [readerOverrides]。
+  /// 某顆讀卡機實際生效的設定：全域值套上該顆的覆寫，
+  /// 結果不再帶 [readerOverrides] 與 [enabledReaders] (單顆的時序用不到)。
   RfidTimingConfig forReader(String deviceId) {
     final overrides = readerOverrides[normalizeDeviceId(deviceId)];
-    if (overrides == null || overrides.isEmpty) return withoutReaderOverrides();
+    if (overrides == null || overrides.isEmpty) {
+      return withoutReaderOverrides().copyWith(enabledReaders: const []);
+    }
     final json = Map<String, dynamic>.from(toBaseJson());
     for (final entry in overrides.entries) {
       if (perReaderKeys.contains(entry.key)) json[entry.key] = entry.value;
@@ -469,6 +548,7 @@ class RfidTimingConfig {
     int? pollGapMs,
     int? stickyRounds,
     Map<String, Map<String, int>>? readerOverrides,
+    List<int>? enabledReaders,
   }) {
     return RfidTimingConfig(
       spiSpeedHz: spiSpeedHz ?? this.spiSpeedHz,
@@ -487,6 +567,7 @@ class RfidTimingConfig {
       pollGapMs: pollGapMs ?? this.pollGapMs,
       stickyRounds: stickyRounds ?? this.stickyRounds,
       readerOverrides: readerOverrides ?? this.readerOverrides,
+      enabledReaders: enabledReaders ?? this.enabledReaders,
     );
   }
 
@@ -511,6 +592,9 @@ class RfidTimingConfig {
           },
     };
     json[readersKey] = overrides;
+    // 手寫的 const 設定可能沒排序或有重複，一併正規化；壞值 (0、負數) 整段丟掉
+    json[enabledReadersKey] =
+        parseReaderNumbers(enabledReaders) ?? const <int>[];
     return RfidTimingConfig.fromJson(json);
   }
 
@@ -545,6 +629,16 @@ class RfidTimingConfig {
       }
       result = result.withValue(key, value);
       applied?.add(key);
+    }
+    final rawEnabled = environment[enabledReadersEnvKey];
+    if (rawEnabled != null) {
+      final enabled = parseReaderNumbers(rawEnabled);
+      if (enabled == null) {
+        invalid?.add(enabledReadersEnvKey);
+      } else {
+        result = result.copyWith(enabledReaders: enabled);
+        applied?.add(enabledReadersKey);
+      }
     }
     return result;
   }
@@ -637,6 +731,7 @@ class RfidTimingConfig {
           .map((entry) => '${entry.key}=${entry.value}')
           .join(', ');
     }
+    map[enabledReadersLabel] = enabledReadersText;
     return map;
   }
 
@@ -744,7 +839,8 @@ class RfidTimingConfig {
       other.readerRetries == readerRetries &&
       other.pollGapMs == pollGapMs &&
       other.stickyRounds == stickyRounds &&
-      other._canonicalOverrides() == _canonicalOverrides();
+      other._canonicalOverrides() == _canonicalOverrides() &&
+      other.enabledReaders.join(',') == enabledReaders.join(',');
 
   @override
   int get hashCode => Object.hash(
@@ -764,6 +860,7 @@ class RfidTimingConfig {
         pollGapMs,
         stickyRounds,
         _canonicalOverrides(),
+        enabledReaders.join(','),
       );
 
   @override

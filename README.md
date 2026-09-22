@@ -125,6 +125,7 @@ curl -fsSL https://raw.githubusercontent.com/simonzhao219/smart_bite/main/script
 ```bash
 smart_bite                    # 或 /opt/smart_bite/smart_bite，會全螢幕啟動
 RFID_MODE=mock smart_bite     # 沒接 RC522 時改用 mock 讀卡機
+RFID_ENABLED_READERS=1 smart_bite   # 只接了 1 號讀卡機時只掃它 (也可在設定頁勾選或寫進 rfid_timing.json)
 # 更新：再跑一次同一行 curl 指令
 ```
 

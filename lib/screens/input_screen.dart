@@ -428,8 +428,9 @@ class OrderPage extends StatelessWidget {
       // Get the (merged) reading for this reader
       final reading = provider.getReading(reader.deviceId);
 
-      // Only show readers that have cards
-      if (reading?.hasCard == true) {
+      // Only show readers that have cards. 讀到與別顆相同卡片的讀卡機
+      // (RST 沒拉低造成的重複) 不顯示，同一道菜才不會出現七次
+      if (reading?.hasCard == true && !provider.isDuplicate(reader.deviceId)) {
         // Get meal identification service
         final mealService = MealIdentificationService();
         final mealName = mealService.identifyMeal(reading!.rfid);

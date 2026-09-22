@@ -29,6 +29,9 @@ enum ReaderStatus {
   
   /// Reader is disconnected or offline
   disconnected,
+
+  /// 設定裡沒啟用 (沒接這顆)：輪巡時略過，不算線路異常
+  disabled,
 }
 
 /// Represents a single RFID card reading event
@@ -80,6 +83,17 @@ class RFIDReading {
       rfid: '',
       timestamp: DateTime.now(),
       errorMessage: errorMessage,
+    );
+  }
+
+  /// 設定裡沒啟用的讀卡機：沒有卡片、也不是錯誤
+  factory RFIDReading.disabled(String deviceId) {
+    return RFIDReading(
+      deviceId: deviceId,
+      status: ReaderStatus.disabled,
+      rfid: '',
+      timestamp: DateTime.now(),
+      rawData: 'DISABLED',
     );
   }
 

@@ -14,6 +14,18 @@
 ///    否則用呼叫端給的路徑，再否則是 `~/Documents/rfid_timing.json`)
 /// 3. 環境變數逐項覆寫，例如 `RFID_SPI_SPEED_HZ=500000`
 /// 4. 範圍檢查，超出合理範圍的值會被夾回邊界
+///
+/// 除了全域值，設定檔的 `readers` 區段可以對單顆讀卡機覆寫
+/// [perReaderKeys] 裡的欄位，例如線最長的那顆需要比較長的等待：
+///
+/// ```json
+/// {
+///   "rstSettleMs": 20,
+///   "readers": { "07": { "rstSettleMs": 30, "antennaSettleMs": 10 } }
+/// }
+/// ```
+///
+/// 自動最佳化會替每顆讀卡機各自找出最小可靠值並寫進 `readers`。
 library;
 
 import 'dart:convert';
@@ -72,8 +84,11 @@ class RfidTimingConfig {
   /// 逐項覆寫用的環境變數前綴，例如 `RFID_SPI_SPEED_HZ`
   static const String envPrefix = 'RFID_';
 
+  /// 設定檔裡每顆讀卡機覆寫區段的 key
+  static const String readersKey = 'readers';
+
   /// SPI 時脈 (Hz)。線長、負載重時可降到 500000 或 250000，
-  /// 每次傳輸只有 2 bytes，降速對整輪時間影響很小。
+  /// 每次傳輸只有 2 bytes，降速對整輪時間影響很小。整條 bus 共用，不能每顆不同。
   final int spiSpeedHz;
 
   /// RST 拉高後等待振盪器啟動的時間 (ms)。
@@ -107,6 +122,10 @@ class RfidTimingConfig {
   /// 整輪掃描的逾時 (秒)，超過就視為硬體卡死並回報錯誤。
   final int scanTimeoutSec;
 
+  /// 每顆讀卡機的覆寫值：deviceId ("01"…"07") → {欄位: 值}。
+  /// 只允許 [perReaderKeys] 裡的欄位，其他會被忽略。
+  final Map<String, Map<String, int>> readerOverrides;
+
   const RfidTimingConfig({
     this.spiSpeedHz = 1000000,
     this.rstSettleMs = 50,
@@ -118,12 +137,13 @@ class RfidTimingConfig {
     this.interReaderGapMs = 1,
     this.postScanSettleMs = 0,
     this.scanTimeoutSec = 10,
+    this.readerOverrides = const {},
   });
 
   /// 程式內建預設值
   static const RfidTimingConfig defaults = RfidTimingConfig();
 
-  /// 所有可調欄位的名稱 (同時也是 JSON key)
+  /// 所有全域欄位的名稱 (同時也是 JSON key)
   static const List<String> keys = [
     'spiSpeedHz',
     'rstSettleMs',
@@ -135,6 +155,16 @@ class RfidTimingConfig {
     'interReaderGapMs',
     'postScanSettleMs',
     'scanTimeoutSec',
+  ];
+
+  /// 可以對單顆讀卡機覆寫的欄位
+  static const List<String> perReaderKeys = [
+    'rstSettleMs',
+    'linkCheckTimeoutMs',
+    'antennaSettleMs',
+    'reqaTimeoutMs',
+    'reqaAttempts',
+    'commDeadlineMs',
   ];
 
   /// 每個欄位允許的範圍 (含)
@@ -151,11 +181,51 @@ class RfidTimingConfig {
     'scanTimeoutSec': (1, 120),
   };
 
+  /// 每個欄位的中文說明，給設定頁與 CLI 用
+  static const Map<String, String> labels = {
+    'spiSpeedHz': 'SPI 時脈 (Hz)',
+    'rstSettleMs': 'RST 拉高後等待 (ms)',
+    'linkCheckTimeoutMs': '連線檢查最多再等 (ms)',
+    'antennaSettleMs': '天線開啟後等待 (ms)',
+    'reqaTimeoutMs': 'REQA 晶片逾時 (ms)',
+    'reqaAttempts': 'REQA 嘗試次數',
+    'commDeadlineMs': '通訊牆鐘上限 (ms)',
+    'interReaderGapMs': '讀卡機之間間隔 (ms)',
+    'postScanSettleMs': '整輪結束後等待 (ms)',
+    'scanTimeoutSec': '整輪逾時 (秒)',
+  };
+
+  /// 每個欄位的一句話說明，給設定頁的編輯表單用
+  static const Map<String, String> hints = {
+    'spiSpeedHz': '整條 bus 共用。線長或負載重時降到 500000 / 250000。',
+    'rstSettleMs': 'RST 拉高後等振盪器啟動。datasheet 只需幾 ms，50 是保守值。',
+    'linkCheckTimeoutMs': 'VersionReg 讀不到時最多再等多久，正常時用不到。',
+    'antennaSettleMs': '天線開啟後讓卡片上電。ISO 14443 要求 5 ms 內就緒。',
+    'reqaTimeoutMs': '沒卡時每次 REQA 要等這麼久才放棄。',
+    'reqaAttempts': '每顆 REQA 最多試幾次。',
+    'commDeadlineMs': '軟體端等 IRQ 的上限，會自動 ≥ REQA 逾時 + 10。',
+    'interReaderGapMs': '兩顆之間的間隔。',
+    'postScanSettleMs': '整輪結束後的額外等待。',
+    'scanTimeoutSec': '整輪超過這個時間視為硬體卡死。會自動 ≥ 最壞情況 × 2。',
+  };
+
   /// 軟體等待 IRQ 的實際上限
   int get effectiveCommDeadlineMs =>
       commDeadlineMs < reqaTimeoutMs + 10 ? reqaTimeoutMs + 10 : commDeadlineMs;
 
-  Map<String, int> toJson() => {
+  /// 是否有任何一顆讀卡機有覆寫值
+  bool get hasReaderOverrides =>
+      readerOverrides.values.any((values) => values.isNotEmpty);
+
+  /// 有覆寫值的讀卡機 deviceId (已排序)
+  List<String> get overriddenReaderIds => readerOverrides.entries
+      .where((entry) => entry.value.isNotEmpty)
+      .map((entry) => entry.key)
+      .toList()
+    ..sort();
+
+  /// 只含全域欄位的 JSON
+  Map<String, int> toBaseJson() => {
         'spiSpeedHz': spiSpeedHz,
         'rstSettleMs': rstSettleMs,
         'linkCheckTimeoutMs': linkCheckTimeoutMs,
@@ -168,12 +238,45 @@ class RfidTimingConfig {
         'scanTimeoutSec': scanTimeoutSec,
       };
 
+  /// 全域欄位加上 `readers` 區段 (沒有覆寫時省略)
+  Map<String, dynamic> toJson() {
+    final json = <String, dynamic>{...toBaseJson()};
+    if (hasReaderOverrides) {
+      json[readersKey] = {
+        for (final id in overriddenReaderIds)
+          id: Map<String, int>.from(readerOverrides[id]!),
+      };
+    }
+    return json;
+  }
+
   /// 從 JSON 建立。缺少或型別不對的欄位沿用 [base] 的值。
   factory RfidTimingConfig.fromJson(
     Map<String, dynamic> json, {
     RfidTimingConfig base = defaults,
   }) {
     int pick(String key, int fallback) => parseIntValue(json[key]) ?? fallback;
+
+    final overrides = <String, Map<String, int>>{};
+    final rawReaders = json[readersKey];
+    if (rawReaders is Map) {
+      for (final entry in rawReaders.entries) {
+        if (entry.value is! Map) continue;
+        final values = <String, int>{};
+        for (final inner in (entry.value as Map).entries) {
+          final key = inner.key.toString();
+          final value = parseIntValue(inner.value);
+          if (perReaderKeys.contains(key) && value != null) {
+            values[key] = value;
+          }
+        }
+        if (values.isNotEmpty) overrides[entry.key.toString()] = values;
+      }
+    } else if (base.readerOverrides.isNotEmpty) {
+      for (final entry in base.readerOverrides.entries) {
+        overrides[entry.key] = Map<String, int>.from(entry.value);
+      }
+    }
 
     return RfidTimingConfig(
       spiSpeedHz: pick('spiSpeedHz', base.spiSpeedHz),
@@ -186,6 +289,7 @@ class RfidTimingConfig {
       interReaderGapMs: pick('interReaderGapMs', base.interReaderGapMs),
       postScanSettleMs: pick('postScanSettleMs', base.postScanSettleMs),
       scanTimeoutSec: pick('scanTimeoutSec', base.scanTimeoutSec),
+      readerOverrides: overrides,
     );
   }
 
@@ -197,23 +301,73 @@ class RfidTimingConfig {
     return null;
   }
 
-  /// 讀取單一欄位
+  /// 讀取單一全域欄位
   int valueOf(String key) {
-    final value = toJson()[key];
+    final value = toBaseJson()[key];
     if (value == null) {
       throw ArgumentError.value(key, 'key', '不是有效的時序欄位');
     }
     return value;
   }
 
-  /// 回傳改了單一欄位的新設定
+  /// 回傳改了單一全域欄位的新設定
   RfidTimingConfig withValue(String key, int value) {
     if (!keys.contains(key)) {
       throw ArgumentError.value(key, 'key', '不是有效的時序欄位');
     }
-    final json = Map<String, dynamic>.from(toJson());
+    final json = Map<String, dynamic>.from(toBaseJson());
     json[key] = value;
     return RfidTimingConfig.fromJson(json, base: this);
+  }
+
+  /// 某顆讀卡機實際生效的設定：全域值套上該顆的覆寫，結果不再帶 [readerOverrides]。
+  RfidTimingConfig forReader(String deviceId) {
+    final overrides = readerOverrides[deviceId];
+    if (overrides == null || overrides.isEmpty) return withoutReaderOverrides();
+    final json = Map<String, dynamic>.from(toBaseJson());
+    for (final entry in overrides.entries) {
+      if (perReaderKeys.contains(entry.key)) json[entry.key] = entry.value;
+    }
+    return RfidTimingConfig.fromJson(json);
+  }
+
+  /// 去掉所有讀卡機覆寫
+  RfidTimingConfig withoutReaderOverrides() =>
+      copyWith(readerOverrides: const {});
+
+  /// 設定某顆讀卡機的單一覆寫值
+  RfidTimingConfig withReaderOverride(String deviceId, String key, int value) {
+    if (!perReaderKeys.contains(key)) {
+      throw ArgumentError.value(key, 'key', '不是可以對單顆覆寫的欄位');
+    }
+    return withReaderOverrides(deviceId, {key: value});
+  }
+
+  /// 合併某顆讀卡機的覆寫值 (既有的其他欄位保留)
+  RfidTimingConfig withReaderOverrides(
+    String deviceId,
+    Map<String, int> values,
+  ) {
+    final merged = <String, Map<String, int>>{
+      for (final entry in readerOverrides.entries)
+        entry.key: Map<String, int>.from(entry.value),
+    };
+    final target = merged.putIfAbsent(deviceId, () => {});
+    for (final entry in values.entries) {
+      if (perReaderKeys.contains(entry.key)) target[entry.key] = entry.value;
+    }
+    return copyWith(readerOverrides: merged);
+  }
+
+  /// 清掉某顆 (或全部) 讀卡機的覆寫
+  RfidTimingConfig clearReaderOverrides([String? deviceId]) {
+    if (deviceId == null) return withoutReaderOverrides();
+    final remaining = <String, Map<String, int>>{
+      for (final entry in readerOverrides.entries)
+        if (entry.key != deviceId)
+          entry.key: Map<String, int>.from(entry.value),
+    };
+    return copyWith(readerOverrides: remaining);
   }
 
   RfidTimingConfig copyWith({
@@ -227,6 +381,7 @@ class RfidTimingConfig {
     int? interReaderGapMs,
     int? postScanSettleMs,
     int? scanTimeoutSec,
+    Map<String, Map<String, int>>? readerOverrides,
   }) {
     return RfidTimingConfig(
       spiSpeedHz: spiSpeedHz ?? this.spiSpeedHz,
@@ -239,18 +394,32 @@ class RfidTimingConfig {
       interReaderGapMs: interReaderGapMs ?? this.interReaderGapMs,
       postScanSettleMs: postScanSettleMs ?? this.postScanSettleMs,
       scanTimeoutSec: scanTimeoutSec ?? this.scanTimeoutSec,
+      readerOverrides: readerOverrides ?? this.readerOverrides,
     );
   }
 
-  /// 把每個欄位夾回 [ranges] 定義的範圍
+  static int _clamp(String key, int value) {
+    final (low, high) = ranges[key]!;
+    return value < low ? low : (value > high ? high : value);
+  }
+
+  /// 把每個欄位 (含讀卡機覆寫) 夾回 [ranges] 定義的範圍
   RfidTimingConfig validated() {
-    final json = Map<String, dynamic>.from(toJson());
+    final json = Map<String, dynamic>.from(toBaseJson());
     for (final key in keys) {
-      final (low, high) = ranges[key]!;
-      final value = json[key] as int;
-      json[key] = value < low ? low : (value > high ? high : value);
+      json[key] = _clamp(key, json[key] as int);
     }
-    return RfidTimingConfig.fromJson(json, base: this);
+    final overrides = <String, Map<String, int>>{
+      for (final entry in readerOverrides.entries)
+        if (entry.value.isNotEmpty)
+          entry.key: {
+            for (final inner in entry.value.entries)
+              if (perReaderKeys.contains(inner.key))
+                inner.key: _clamp(inner.key, inner.value),
+          },
+    };
+    json[readersKey] = overrides;
+    return RfidTimingConfig.fromJson(json);
   }
 
   /// 欄位名稱對應的環境變數，例如 `spiSpeedHz` → `RFID_SPI_SPEED_HZ`
@@ -265,7 +434,7 @@ class RfidTimingConfig {
     return buffer.toString();
   }
 
-  /// 套用環境變數覆寫。[applied] 會收到實際被覆寫的欄位名稱。
+  /// 套用環境變數覆寫 (只影響全域欄位)。[applied] 會收到實際被覆寫的欄位名稱。
   RfidTimingConfig applyEnvironment(
     Map<String, String> environment, {
     List<String>? applied,
@@ -347,53 +516,75 @@ class RfidTimingConfig {
 
   String toPrettyJson() => const JsonEncoder.withIndent('  ').convert(toJson());
 
-  /// 每個欄位的中文說明，給設定頁與 CLI 用
-  static const Map<String, String> labels = {
-    'spiSpeedHz': 'SPI 時脈 (Hz)',
-    'rstSettleMs': 'RST 拉高後等待 (ms)',
-    'linkCheckTimeoutMs': '連線檢查最多再等 (ms)',
-    'antennaSettleMs': '天線開啟後等待 (ms)',
-    'reqaTimeoutMs': 'REQA 晶片逾時 (ms)',
-    'reqaAttempts': 'REQA 嘗試次數',
-    'commDeadlineMs': '通訊牆鐘上限 (ms)',
-    'interReaderGapMs': '讀卡機之間間隔 (ms)',
-    'postScanSettleMs': '整輪結束後等待 (ms)',
-    'scanTimeoutSec': '整輪逾時 (秒)',
-  };
-
-  /// 「中文標籤 → 值」的對照，給 UI 顯示
+  /// 「中文標籤 → 值」的對照，給 UI 顯示；有覆寫的讀卡機各列一行
   Map<String, String> describe() {
-    final json = toJson();
-    return {
+    final json = toBaseJson();
+    final map = <String, String>{
       for (final key in keys) labels[key]!: json[key].toString(),
     };
+    for (final id in overriddenReaderIds) {
+      map['讀卡機 $id 覆寫'] = readerOverrides[id]!
+          .entries
+          .map((entry) => '${entry.key}=${entry.value}')
+          .join(', ');
+    }
+    return map;
   }
 
-  /// 估算無卡時一輪掃描的時間 (ms)，給文件與 UI 做參考。
-  ///
-  /// 每顆約需：RST 等待 + 暫存器設定 (約 2 ms) + 天線等待 +
-  /// 每次 REQA 的晶片逾時 × 次數 + 收尾 (約 2 ms) + 讀卡機間隔。
-  int estimateNoCardScanMs(int readerCount) {
-    const overheadPerReaderMs = 4;
-    final perReader = rstSettleMs +
-        antennaSettleMs +
-        reqaTimeoutMs * reqaAttempts +
-        interReaderGapMs +
-        overheadPerReaderMs;
-    return perReader * readerCount + postScanSettleMs;
-  }
+  /// 每顆讀卡機不含等待卡片回應的固定開銷 (暫存器設定、收尾等)，估算用
+  static const int perReaderOverheadMs = 4;
 
-  /// 估算最壞情況一輪的時間 (ms)：每顆都用到連線檢查的保險時間、
-  /// 每次 REQA 都等到軟體牆鐘上限。整輪逾時會以它的兩倍為下限。
+  /// 無卡時一顆讀卡機的估計時間 (ms)
+  static int noCardReaderMs(RfidTimingConfig timing) =>
+      timing.rstSettleMs +
+      timing.antennaSettleMs +
+      timing.reqaTimeoutMs * timing.reqaAttempts +
+      timing.interReaderGapMs +
+      perReaderOverheadMs;
+
+  /// 有卡時一顆讀卡機的估計時間 (ms)：REQA 幾乎立刻有回應
+  static int cardReaderMs(RfidTimingConfig timing) =>
+      timing.rstSettleMs +
+      timing.antennaSettleMs +
+      timing.interReaderGapMs +
+      perReaderOverheadMs +
+      2;
+
+  /// 最壞情況一顆讀卡機的估計時間 (ms)：用到連線檢查的保險時間、
+  /// 每次 REQA 都等到軟體牆鐘上限
+  static int worstCaseReaderMs(RfidTimingConfig timing) =>
+      timing.rstSettleMs +
+      timing.linkCheckTimeoutMs +
+      timing.antennaSettleMs +
+      timing.effectiveCommDeadlineMs * timing.reqaAttempts +
+      timing.interReaderGapMs +
+      perReaderOverheadMs;
+
+  /// 估算無卡時一輪掃描的時間 (ms)，只用全域值 (不看覆寫)
+  int estimateNoCardScanMs(int readerCount) =>
+      noCardReaderMs(withoutReaderOverrides()) * readerCount + postScanSettleMs;
+
+  /// 估算無卡時一輪掃描的時間 (ms)，每顆用各自生效的值
+  int estimateNoCardScanMsFor(Iterable<String> deviceIds) =>
+      deviceIds.fold<int>(0, (sum, id) => sum + noCardReaderMs(forReader(id))) +
+      postScanSettleMs;
+
+  /// 估算七顆都有卡時一輪掃描的時間 (ms)，每顆用各自生效的值
+  int estimateAllCardsScanMsFor(Iterable<String> deviceIds) =>
+      deviceIds.fold<int>(0, (sum, id) => sum + cardReaderMs(forReader(id))) +
+      postScanSettleMs;
+
+  /// 估算最壞情況一輪的時間 (ms)。有覆寫時每顆取全域值與覆寫值中較大的那個。
   int estimateWorstCaseScanMs(int readerCount) {
-    const overheadPerReaderMs = 4;
-    final perReader = rstSettleMs +
-        linkCheckTimeoutMs +
-        antennaSettleMs +
-        effectiveCommDeadlineMs * reqaAttempts +
-        interReaderGapMs +
-        overheadPerReaderMs;
-    return perReader * readerCount + postScanSettleMs;
+    var worst = withoutReaderOverrides();
+    for (final values in readerOverrides.values) {
+      for (final entry in values.entries) {
+        if (entry.value > worst.valueOf(entry.key)) {
+          worst = worst.withValue(entry.key, entry.value);
+        }
+      }
+    }
+    return worstCaseReaderMs(worst) * readerCount + postScanSettleMs;
   }
 
   /// 整輪掃描實際使用的逾時：設定值與「最壞情況 × 2」取較大者，
@@ -404,6 +595,20 @@ class RfidTimingConfig {
     return Duration(
       milliseconds: worstCaseMs > configuredMs ? worstCaseMs : configuredMs,
     );
+  }
+
+  String _canonicalOverrides() {
+    final buffer = StringBuffer();
+    for (final id in overriddenReaderIds) {
+      final entries = readerOverrides[id]!.entries.toList()
+        ..sort((a, b) => a.key.compareTo(b.key));
+      buffer.write('$id:');
+      for (final entry in entries) {
+        buffer.write('${entry.key}=${entry.value},');
+      }
+      buffer.write(';');
+    }
+    return buffer.toString();
   }
 
   @override
@@ -418,7 +623,8 @@ class RfidTimingConfig {
       other.commDeadlineMs == commDeadlineMs &&
       other.interReaderGapMs == interReaderGapMs &&
       other.postScanSettleMs == postScanSettleMs &&
-      other.scanTimeoutSec == scanTimeoutSec;
+      other.scanTimeoutSec == scanTimeoutSec &&
+      other._canonicalOverrides() == _canonicalOverrides();
 
   @override
   int get hashCode => Object.hash(
@@ -432,6 +638,7 @@ class RfidTimingConfig {
         interReaderGapMs,
         postScanSettleMs,
         scanTimeoutSec,
+        _canonicalOverrides(),
       );
 
   @override

@@ -22,6 +22,7 @@ import '../services/meal_identification_service.dart';
 import '../services/pdf_generation_service.dart';
 import '../services/printer_service.dart';
 import 'printer_selection_dialog.dart';
+import 'rfid_timing_settings.dart';
 
 class SettingPage extends StatelessWidget {
   const SettingPage({super.key});
@@ -133,73 +134,9 @@ class SettingPage extends StatelessWidget {
     }
   }
 
-  /// 輪巡時序設定與診斷 (預設收合，展開才佔空間)
+  /// 輪巡時序設定：編輯、連線檢測、自動最佳化 (見 rfid_timing_settings.dart)
   Widget _buildTimingInfo(BuildContext context, RFIDReaderProvider provider) {
-    final diagnostics = provider.diagnostics;
-    final scanMs = provider.lastScanDuration?.inMilliseconds;
-    final textTheme = Theme.of(context).textTheme;
-
-    return Card(
-      elevation: 2,
-      child: ExpansionTile(
-        leading: const Icon(Icons.timer_outlined),
-        title: Text(
-          '輪巡時序設定',
-          style: textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
-        ),
-        subtitle: Text(
-          scanMs != null ? '上次掃描耗時 $scanMs ms' : '尚未掃描',
-          style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
-        ),
-        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-        expandedCrossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          for (final entry in diagnostics.entries)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SizedBox(
-                    width: 170,
-                    child: Text(
-                      entry.key,
-                      style: textTheme.bodySmall
-                          ?.copyWith(fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                  Expanded(
-                    child: SelectableText(
-                      entry.value,
-                      style: textTheme.bodySmall,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              OutlinedButton.icon(
-                onPressed: provider.isScanning
-                    ? null
-                    : () => provider.reloadSettings(),
-                icon: const Icon(Icons.refresh, size: 18),
-                label: const Text('重新載入設定檔'),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  '校正工具: dart run scripts/rfid_calibrate.dart '
-                  '(說明見 documents/RFID_TIMING_TUNING.md)',
-                  style: textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
+    return RfidTimingSettingsCard(provider: provider);
   }
 
   Widget _buildReaderStatusSection(

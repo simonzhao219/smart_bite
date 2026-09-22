@@ -197,4 +197,24 @@ void main() {
       expect(restored.toString(), contains('512ms'));
     });
   });
+
+  group('LinkMeasurement JSON', () {
+    test('往返', () {
+      final measurement = measure(
+        deviceId: '04',
+        speed: 500000,
+        readyMs: 3,
+        mismatches: 2,
+        version: 0x91,
+      );
+      final restored = LinkMeasurement.fromJson(measurement.toJson());
+      expect(restored.spiSpeedHz, 500000);
+      expect(restored.probe.deviceId, '04');
+      expect(restored.probe.timeToReadyMs, 3);
+      expect(restored.probe.mismatches, 2);
+      expect(restored.probe.samples, 400);
+      expect(restored.probe.version, 0x91);
+      expect(restored.probe.clean, isFalse);
+    });
+  });
 }

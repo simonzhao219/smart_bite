@@ -9,6 +9,10 @@ library;
 
 import 'package:flutter/foundation.dart';
 
+import '../services/rfid_calibration.dart';
+import '../services/rfid_optimizer.dart';
+import '../services/rfid_timing_config.dart';
+
 /// Status of an individual RFID reader module
 enum ReaderStatus {
   /// Reader is initialized but not yet connected
@@ -176,6 +180,35 @@ abstract class RFIDReaderManager extends ChangeNotifier {
 
   /// 重新載入設定 (例如 RFID 時序設定檔)；實作不支援時什麼都不做
   Future<void> reloadSettings();
+
+  /// 是否支援時序設定、連線檢測與自動最佳化 (GPIO 實作才有)
+  bool get supportsCalibration;
+
+  /// 連線檢測或自動最佳化進行中
+  bool get isCalibrating;
+
+  /// 目前載入的時序設定 (含來源)；尚未載入或不支援時為 null
+  RfidTimingLoadResult? get timingLoad;
+
+  /// 讀取 (必要時載入) 時序設定；不支援時回 null
+  Future<RfidTimingLoadResult?> loadTiming();
+
+  /// 儲存時序設定到設定檔並重新載入；不支援時拋 [UnsupportedError]
+  Future<void> saveTiming(RfidTimingConfig config);
+
+  /// 連線檢測：各 SPI 時脈下每顆的就緒時間與讀寫錯誤率
+  Future<List<LinkMeasurement>> probeLinks({
+    List<int>? speeds,
+    int samples = 200,
+    void Function(String message)? onProgress,
+  });
+
+  /// 自動最佳化 (七顆都要放卡片)
+  Future<OptimizationResult> optimize(
+    RfidOptimizerOptions options, {
+    void Function(OptimizerProgress progress)? onProgress,
+    RfidCancelToken? cancel,
+  });
   
   /// Dispose of all readers and clean up resources
   @override

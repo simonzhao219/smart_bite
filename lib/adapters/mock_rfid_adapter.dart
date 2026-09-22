@@ -12,6 +12,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import '../interfaces/rfid_reader.dart';
+import '../services/rfid_calibration.dart';
+import '../services/rfid_optimizer.dart';
+import '../services/rfid_timing_config.dart';
 
 /// Mock RFID reader that simulates reading behavior
 class MockRFIDAdapter implements RFIDReader {
@@ -243,6 +246,41 @@ class MockRFIDReaderManager extends ChangeNotifier
   @override
   Future<void> reloadSettings() async {
     // Mock 沒有可重新載入的設定
+  }
+
+  @override
+  bool get supportsCalibration => false;
+
+  @override
+  bool get isCalibrating => false;
+
+  @override
+  RfidTimingLoadResult? get timingLoad => null;
+
+  @override
+  Future<RfidTimingLoadResult?> loadTiming() async => null;
+
+  @override
+  Future<void> saveTiming(RfidTimingConfig config) async {
+    throw UnsupportedError('Mock 讀卡機沒有時序設定');
+  }
+
+  @override
+  Future<List<LinkMeasurement>> probeLinks({
+    List<int>? speeds,
+    int samples = 200,
+    void Function(String message)? onProgress,
+  }) async {
+    throw UnsupportedError('Mock 讀卡機不支援連線檢測');
+  }
+
+  @override
+  Future<OptimizationResult> optimize(
+    RfidOptimizerOptions options, {
+    void Function(OptimizerProgress progress)? onProgress,
+    RfidCancelToken? cancel,
+  }) async {
+    throw UnsupportedError('Mock 讀卡機不支援自動最佳化');
   }
 
   @override

@@ -208,6 +208,25 @@ class LinkProbeResult {
 
   double get errorRate => samples == 0 ? 0 : mismatches / samples;
 
+  Map<String, dynamic> toJson() => {
+        'deviceId': deviceId,
+        'timeToReadyMs': timeToReadyMs,
+        'version': version,
+        'samples': samples,
+        'mismatches': mismatches,
+        'elapsedMs': elapsedMs,
+      };
+
+  factory LinkProbeResult.fromJson(Map<String, dynamic> json) =>
+      LinkProbeResult(
+        deviceId: json['deviceId'] as String,
+        timeToReadyMs: (json['timeToReadyMs'] as num?)?.toInt(),
+        version: (json['version'] as num?)?.toInt() ?? 0,
+        samples: (json['samples'] as num?)?.toInt() ?? 0,
+        mismatches: (json['mismatches'] as num?)?.toInt() ?? 0,
+        elapsedMs: (json['elapsedMs'] as num?)?.toInt() ?? 0,
+      );
+
   @override
   String toString() =>
       'LinkProbeResult($deviceId: ready=${timeToReadyMs ?? '-'}ms, '
@@ -240,18 +259,23 @@ class SimpleMFRC522 {
   void open() => resetLine.open();
 
   /// 讀一次卡片。不論結果如何，離開時天線關閉、RST 拉低。
-  Future<ReaderScanResult> scanOnce() async {
+  ///
+  /// [timing] 可以指定這一次要用的時序 (例如最佳化時每輪不同)，
+  /// 不給就用建構時的設定。
+  Future<ReaderScanResult> scanOnce({RfidTimingConfig? timing}) async {
     final stopwatch = Stopwatch()..start();
+    final t = timing ?? this.timing;
+    chip.commDeadlineMs = t.effectiveCommDeadlineMs;
     int? version;
     int? readyMs;
     var attempts = 0;
 
     try {
       resetLine.high();
-      await _sleep(timing.rstSettleMs);
+      await _sleep(t.rstSettleMs);
 
       // 連線檢查：VersionReg 讀不到合理值就是線路問題，不用再往下做
-      final linkDeadline = timing.rstSettleMs + timing.linkCheckTimeoutMs;
+      final linkDeadline = t.rstSettleMs + t.linkCheckTimeoutMs;
       version = chip.readVersion();
       while (!MFRC522Version.isPlausible(version!) &&
           stopwatch.elapsedMilliseconds < linkDeadline) {
@@ -270,11 +294,11 @@ class SimpleMFRC522 {
       }
       readyMs = stopwatch.elapsedMilliseconds;
 
-      chip.configure(reqaTimeoutMs: timing.reqaTimeoutMs);
-      await _sleep(timing.antennaSettleMs);
+      chip.configure(reqaTimeoutMs: t.reqaTimeoutMs);
+      await _sleep(t.antennaSettleMs);
 
       var lastStatus = MFRC522Status.notag;
-      while (attempts < timing.reqaAttempts) {
+      while (attempts < t.reqaAttempts) {
         attempts++;
         final request = chip.request(PICCCommands.reqidl);
         lastStatus = request.status;

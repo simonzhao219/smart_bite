@@ -16,6 +16,19 @@ class LinkMeasurement {
   final LinkProbeResult probe;
 
   const LinkMeasurement({required this.spiSpeedHz, required this.probe});
+
+  Map<String, dynamic> toJson() => {
+        'spiSpeedHz': spiSpeedHz,
+        'probe': probe.toJson(),
+      };
+
+  factory LinkMeasurement.fromJson(Map<String, dynamic> json) =>
+      LinkMeasurement(
+        spiSpeedHz: (json['spiSpeedHz'] as num).toInt(),
+        probe: LinkProbeResult.fromJson(
+          Map<String, dynamic>.from(json['probe'] as Map),
+        ),
+      );
 }
 
 /// 推薦結果

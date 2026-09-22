@@ -8,7 +8,8 @@
 ///   dart run scripts/rfid_calibrate.dart bench [--rounds 10] [--verbose]
 ///   dart run scripts/rfid_calibrate.dart sweep [--rst 5,10,20,50] [--antenna 0,2,5,10] [--rounds 5]
 ///   dart run scripts/rfid_calibrate.dart recommend [--write] [--speeds ...] [--samples N]
-///   dart run scripts/rfid_calibrate.dart set key=value [key=value ...]
+///   dart run scripts/rfid_calibrate.dart optimize [--write] [--sweep-rounds 5] [--verify-rounds 20] [--margin 1] [--skip-link]
+///   dart run scripts/rfid_calibrate.dart set key=value [01.key=value ...] [01.clear] [clear]
 ///
 /// 共同選項：
 ///   --file <path>   設定檔路徑。預設看 RFID_TIMING_FILE 環境變數，再來是 ~/Documents/rfid_timing.json
@@ -23,6 +24,7 @@ import 'package:dart_periphery/dart_periphery.dart';
 import 'package:smart_bite/models/rfid_models.dart';
 import 'package:smart_bite/services/mfrc522.dart';
 import 'package:smart_bite/services/rfid_calibration.dart';
+import 'package:smart_bite/services/rfid_optimizer.dart';
 import 'package:smart_bite/services/rfid_polling_service.dart';
 import 'package:smart_bite/services/rfid_timing_config.dart';
 import 'package:smart_bite/services/simple_mfrc522.dart';
@@ -50,6 +52,8 @@ Future<void> main(List<String> args) async {
         await _sweep(options);
       case 'recommend':
         await _recommend(options);
+      case 'optimize':
+        await _optimize(options);
       case 'set':
         await _set(options);
       default:
@@ -184,30 +188,152 @@ Future<void> _recommend(_Options options) async {
   print('  app 下次掃描或按「重新載入設定檔」後生效。');
 }
 
+Future<void> _optimize(_Options options) async {
+  final load = await _loadTiming(options);
+  _printTiming(load);
+  print('');
+  print('▶ 自動最佳化：請先在七個感應器都放上卡片。');
+  if (stdin.hasTerminal) {
+    stdout.write('放好後按 Enter 開始 (Ctrl+C 取消)… ');
+    stdin.readLineSync();
+  }
+
+  final optimizerOptions = RfidOptimizerOptions.defaults.copyWith(
+    spiSpeeds: options.speeds,
+    linkSamples: options.samples,
+    sweepRounds: options.sweepRounds,
+    verifyRounds: options.verifyRounds,
+    marginSteps: options.margin,
+    skipLinkStage: options.skipLink,
+  );
+  final runner = HardwareOptimizerRunner(
+    configs: defaultReaderConfigs,
+    base: load.config,
+    log: options.verbose ? print : null,
+  );
+
+  String? lastLine;
+  final optimizer = RfidOptimizer(
+    runner,
+    options: optimizerOptions,
+    onProgress: (progress) {
+      final buffer = StringBuffer(
+        '[${(progress.fraction * 100).toStringAsFixed(0).padLeft(3)}%] '
+        '${progress.stage.label}: ${progress.message}',
+      );
+      if (progress.totalRounds > 0) {
+        buffer.write(' (${progress.round}/${progress.totalRounds})');
+      }
+      if (progress.candidates.isNotEmpty) {
+        final ids = progress.candidates.keys.toList()..sort();
+        buffer.write(
+          '  ${ids.map((id) => '$id:${progress.candidates[id]}').join(' ')}',
+        );
+      }
+      final line = buffer.toString();
+      if (line != lastLine) {
+        print(line);
+        lastLine = line;
+      }
+    },
+  );
+
+  final result = await optimizer.run(base: load.config);
+
+  print('');
+  print('▶ 結果 (共 ${result.roundsRun} 輪，'
+      '${(result.elapsedMs / 1000).toStringAsFixed(0)} 秒)');
+  for (final note in result.notes) {
+    print('  • $note');
+  }
+  print('');
+  print(
+    '${'讀卡機'.padRight(6)} ${'就緒'.padLeft(5)} ${'RST'.padLeft(5)} '
+    '${'天線'.padLeft(5)} ${'REQA'.padLeft(5)} ${'次數'.padLeft(4)} '
+    '${'驗證'.padLeft(7)} 狀態',
+  );
+  for (final id in result.deviceIds) {
+    final r = result.readers[id]!;
+    String value(String key) => r.values[key]?.toString() ?? '-';
+    print(
+      '${id.padRight(6)} ${(r.timeToReadyMs?.toString() ?? '-').padLeft(5)} '
+      '${value('rstSettleMs').padLeft(5)} ${value('antennaSettleMs').padLeft(5)} '
+      '${value('reqaTimeoutMs').padLeft(5)} ${value('reqaAttempts').padLeft(4)} '
+      '${'${r.verifyHits}/${r.verifyRounds}'.padLeft(7)} '
+      '${r.stable ? '穩定' : '不穩定：${r.note ?? ''}'}',
+    );
+  }
+  print('');
+  print('建議設定：');
+  print(result.config.toPrettyJson());
+
+  if (result.cancelled) return;
+  if (!options.write) {
+    print('');
+    print('加上 --write 會把 SPI 時脈與每顆的覆寫值寫入設定檔。');
+    return;
+  }
+
+  final path = _configPath(options);
+  final fileConfig = await _loadFileConfig(path);
+  final merged = fileConfig.copyWith(
+    spiSpeedHz: result.config.spiSpeedHz,
+    readerOverrides: result.config.readerOverrides,
+  );
+  await merged.saveTo(path);
+  print('');
+  print('✓ 已寫入 $path');
+  print('  app 下次掃描或按「重新載入設定檔」後生效。');
+}
+
 Future<void> _set(_Options options) async {
   if (options.assignments.isEmpty) {
-    print('用法: set key=value [key=value ...]');
-    print('可用欄位: ${RfidTimingConfig.keys.join(', ')}');
+    print('用法: set key=value [01.key=value ...] [01.clear] [clear]');
+    print('全域欄位: ${RfidTimingConfig.keys.join(', ')}');
+    print('可對單顆覆寫的欄位: ${RfidTimingConfig.perReaderKeys.join(', ')}');
     exit(1);
   }
 
   final path = _configPath(options);
   var config = await _loadFileConfig(path);
   for (final assignment in options.assignments) {
+    if (assignment == 'clear') {
+      config = config.clearReaderOverrides();
+      continue;
+    }
+    if (assignment.endsWith('.clear')) {
+      config = config.clearReaderOverrides(
+        assignment.substring(0, assignment.length - '.clear'.length),
+      );
+      continue;
+    }
     final parts = assignment.split('=');
     if (parts.length != 2) {
-      throw ArgumentError('格式錯誤: $assignment (應為 key=value)');
+      throw ArgumentError('格式錯誤: $assignment (應為 key=value 或 01.key=value)');
     }
-    final key = parts[0].trim();
+    var key = parts[0].trim();
     final value = RfidTimingConfig.parseIntValue(parts[1]);
     if (value == null) {
       throw ArgumentError('不是整數: $assignment');
     }
-    if (!RfidTimingConfig.keys.contains(key)) {
-      throw ArgumentError(
-          '未知欄位: $key (可用: ${RfidTimingConfig.keys.join(', ')})');
+    final dot = key.indexOf('.');
+    if (dot > 0) {
+      final deviceId = key.substring(0, dot);
+      key = key.substring(dot + 1);
+      if (!RfidTimingConfig.perReaderKeys.contains(key)) {
+        throw ArgumentError(
+          '欄位 $key 不能對單顆覆寫 (可用: ${RfidTimingConfig.perReaderKeys.join(', ')})',
+        );
+      }
+      config = config.withReaderOverride(deviceId, key, value);
+    } else {
+      if (!RfidTimingConfig.keys.contains(key)) {
+        throw ArgumentError(
+          '未知欄位: $key (可用: ${RfidTimingConfig.keys.join(', ')})',
+        );
+      }
+      config = config.withValue(key, value);
     }
-    config = config.withValue(key, value);
   }
 
   final validated = config.validated();
@@ -257,6 +383,11 @@ void _printTiming(RfidTimingLoadResult load) {
   for (final key in RfidTimingConfig.keys) {
     print('  ${key.padRight(20)} = ${json[key].toString().padLeft(8)}'
         '   ${RfidTimingConfig.labels[key]}');
+  }
+  for (final id in load.config.overriddenReaderIds) {
+    final values = load.config.readerOverrides[id]!;
+    print('  讀卡機 $id 覆寫: '
+        '${values.entries.map((e) => '${e.key}=${e.value}').join(', ')}');
   }
   print('  估計無卡一輪約 '
       '${load.config.estimateNoCardScanMs(defaultReaderConfigs.length)} ms');
@@ -362,9 +493,21 @@ class _Options {
   List<int>? readers;
   List<int>? rst;
   List<int>? antenna;
+  int? sweepRounds;
+  int? verifyRounds;
+  int? margin;
+  bool skipLink = false;
   final List<String> assignments = [];
 
-  static const _flags = {'help', 'h', 'verbose', 'v', 'write', 'w'};
+  static const _flags = {
+    'help',
+    'h',
+    'verbose',
+    'v',
+    'write',
+    'w',
+    'skip-link',
+  };
 
   static _Options parse(List<String> args) {
     final options = _Options();
@@ -419,6 +562,14 @@ class _Options {
         rst = _intList(name, _require(name, value));
       case 'antenna':
         antenna = _intList(name, _require(name, value));
+      case 'sweep-rounds':
+        sweepRounds = _int(name, _require(name, value));
+      case 'verify-rounds':
+        verifyRounds = _int(name, _require(name, value));
+      case 'margin':
+        margin = _nonNegative(name, _require(name, value));
+      case 'skip-link':
+        skipLink = true;
       default:
         throw ArgumentError('未知的選項: --$name');
     }
@@ -429,6 +580,14 @@ class _Options {
       throw ArgumentError('--$name 需要一個值');
     }
     return value;
+  }
+
+  static int _nonNegative(String name, String value) {
+    final parsed = int.tryParse(value.trim());
+    if (parsed == null || parsed < 0) {
+      throw ArgumentError('--$name 需要 0 或正整數，收到: $value');
+    }
+    return parsed;
   }
 
   static int _int(String name, String value) {
@@ -471,7 +630,12 @@ RC522 輪巡校正工具 (請先關閉 Smart Bite app 再執行)
   sweep                    掃描不同 rstSettleMs / antennaSettleMs 組合的讀卡成功率 (請先放卡片)
                            選項: --rst 5,10,20,50  --antenna 0,2,5,10  --rounds 5
   recommend                量測後推薦 spiSpeedHz 與 rstSettleMs；加 --write 寫入設定檔
+  optimize                 自動最佳化：連線檢測後，每顆讀卡機各自由大往小找最小可靠值
+                           (七顆都要放卡片)；加 --write 寫入設定檔
+                           選項: --sweep-rounds 5  --verify-rounds 20  --margin 1  --skip-link
   set key=value ...        直接修改設定檔，例如 set rstSettleMs=20 antennaSettleMs=5
+                           單顆覆寫: set 07.rstSettleMs=30 07.antennaSettleMs=10
+                           清除覆寫: set 07.clear 或 set clear
 
 共同選項:
   --file <path>            設定檔路徑 (預設: \$RFID_TIMING_FILE 或 ~/Documents/rfid_timing.json)
@@ -479,5 +643,6 @@ RC522 輪巡校正工具 (請先關閉 Smart Bite app 再執行)
   --help, -h               顯示這份說明
 
 可調欄位: ${RfidTimingConfig.keys.join(', ')}
+可對單顆覆寫: ${RfidTimingConfig.perReaderKeys.join(', ')}
 ''');
 }

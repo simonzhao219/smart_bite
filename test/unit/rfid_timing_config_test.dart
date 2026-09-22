@@ -255,4 +255,130 @@ void main() {
       expect(path, endsWith(RfidTimingConfig.defaultFileName));
     });
   });
+
+  group('RfidTimingConfig reader overrides', () {
+    const config = RfidTimingConfig(
+      rstSettleMs: 20,
+      antennaSettleMs: 5,
+      readerOverrides: {
+        '07': {'rstSettleMs': 30, 'antennaSettleMs': 10},
+        '03': {'reqaAttempts': 3},
+      },
+    );
+
+    test('forReader 套用覆寫，其他顆用全域值，結果不再帶覆寫', () {
+      final r07 = config.forReader('07');
+      expect(r07.rstSettleMs, 30);
+      expect(r07.antennaSettleMs, 10);
+      expect(r07.reqaAttempts, 2);
+      expect(r07.readerOverrides, isEmpty);
+
+      final r01 = config.forReader('01');
+      expect(r01.rstSettleMs, 20);
+      expect(r01, config.withoutReaderOverrides());
+
+      expect(config.hasReaderOverrides, isTrue);
+      expect(config.overriddenReaderIds, ['03', '07']);
+    });
+
+    test('toJson 帶 readers，沒有覆寫時省略；fromJson 只收可覆寫欄位', () {
+      final json = config.toJson();
+      expect(json['readers'], isA<Map>());
+      expect((json['readers'] as Map)['07'],
+          {'rstSettleMs': 30, 'antennaSettleMs': 10});
+      expect(
+          RfidTimingConfig.defaults.toJson().containsKey('readers'), isFalse);
+
+      final parsed = RfidTimingConfig.fromJson({
+        'rstSettleMs': 20,
+        'readers': {
+          '07': {'rstSettleMs': '25', 'spiSpeedHz': 1, 'junk': 'x'},
+          '02': {},
+          '05': 'not a map',
+        },
+      });
+      expect(parsed.readerOverrides, {
+        '07': {'rstSettleMs': 25},
+      });
+      expect(parsed, RfidTimingConfig.fromJson(parsed.toJson()));
+    });
+
+    test('withReaderOverride / withReaderOverrides / clearReaderOverrides', () {
+      final added = RfidTimingConfig.defaults
+          .withReaderOverride('01', 'antennaSettleMs', 8)
+          .withReaderOverrides('01', {'rstSettleMs': 12, 'spiSpeedHz': 5});
+      expect(added.readerOverrides['01'],
+          {'antennaSettleMs': 8, 'rstSettleMs': 12});
+      expect(
+        () =>
+            RfidTimingConfig.defaults.withReaderOverride('01', 'spiSpeedHz', 1),
+        throwsArgumentError,
+      );
+
+      final cleared = config.clearReaderOverrides('07');
+      expect(cleared.readerOverrides.keys, ['03']);
+      expect(config.clearReaderOverrides().hasReaderOverrides, isFalse);
+    });
+
+    test('validated 也會夾覆寫值', () {
+      const wild = RfidTimingConfig(readerOverrides: {
+        '01': {'rstSettleMs': 99999, 'reqaAttempts': 0},
+      });
+      final fixed = wild.validated();
+      expect(fixed.readerOverrides['01'],
+          {'rstSettleMs': 1000, 'reqaAttempts': 1});
+    });
+
+    test('相等性包含覆寫', () {
+      const a = RfidTimingConfig(readerOverrides: {
+        '01': {'rstSettleMs': 10}
+      });
+      const b = RfidTimingConfig(readerOverrides: {
+        '01': {'rstSettleMs': 10}
+      });
+      const c = RfidTimingConfig(readerOverrides: {
+        '01': {'rstSettleMs': 11}
+      });
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+      expect(a == c, isFalse);
+      expect(a == RfidTimingConfig.defaults, isFalse);
+    });
+
+    test('describe 列出覆寫；估算用每顆各自的值', () {
+      final described = config.describe();
+      expect(described['讀卡機 07 覆寫'], contains('rstSettleMs=30'));
+
+      final ids = ['01', '07'];
+      // 01: 20+5+25×2+1+4 = 80；07: 30+10+50+1+4 = 95
+      expect(config.estimateNoCardScanMsFor(ids), 175);
+      // 有卡: 01: 20+5+1+4+2 = 32；07: 30+10+1+4+2 = 47
+      expect(config.estimateAllCardsScanMsFor(ids), 79);
+      // 最壞情況取較大的覆寫值 (rst 30、天線 10、次數 3)
+      expect(
+        config.estimateWorstCaseScanMs(2),
+        RfidTimingConfig.worstCaseReaderMs(const RfidTimingConfig(
+              rstSettleMs: 30,
+              antennaSettleMs: 10,
+              reqaAttempts: 3,
+            )) *
+            2,
+      );
+    });
+
+    test('設定檔往返保留覆寫', () async {
+      final tempDir = await Directory.systemTemp.createTemp('rfid_overrides');
+      try {
+        final path = '${tempDir.path}/rfid_timing.json';
+        await config.saveTo(path);
+        final result = await RfidTimingConfig.load(
+          filePath: path,
+          environment: const {},
+        );
+        expect(result.config, config);
+      } finally {
+        await tempDir.delete(recursive: true);
+      }
+    });
+  });
 }

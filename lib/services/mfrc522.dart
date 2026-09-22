@@ -48,8 +48,9 @@ typedef Mfrc522Reply = ({int status, List<int> backData, int backLen});
 class MFRC522 {
   final Mfrc522Transport bus;
 
-  /// 軟體端等待 IRQ 的牆鐘上限 (ms)，要比晶片 timer 逾時再長一些
-  final int commDeadlineMs;
+  /// 軟體端等待 IRQ 的牆鐘上限 (ms)，要比晶片 timer 逾時再長一些。
+  /// 每次讀取前可以依當次生效的時序設定重新指定。
+  int commDeadlineMs;
 
   MFRC522(this.bus, {this.commDeadlineMs = 36});
 

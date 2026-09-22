@@ -1,7 +1,8 @@
-# RFID 輪巡時序：機制、設定與校正
+# RFID 輪巡時序：機制、設定、校正與自動最佳化
 
 這份文件說明 7 顆 Keyestudio RC522 輪巡的時間花在哪裡、為什麼線長會影響時間、
-新版怎麼把等待值做成可調設定，以及如何在 Raspberry Pi 上用校正工具量出適合自己接線的值。
+新版怎麼把等待值做成可調設定 (全域值加上每顆讀卡機的覆寫)、
+以及如何用設定頁或 CLI 量出適合自己接線的值。
 
 ## 1. 舊版為什麼慢、為什麼線長會影響時間
 
@@ -28,11 +29,11 @@ UI 分不出是沒放餐盤還是線有問題。
 
 ## 2. 新版的輪巡流程
 
-一輪掃描 (`RFIDPollingService.performOneLoopCycles`)：
+一輪掃描 (`RfidScanSession.scanCycle` / `RFIDPollingService.performOneLoopCycles`)：
 
 1. 打開 7 支 RST GPIO 並全部拉低，七顆全部進 hard power-down。
 2. `/dev/spidev0.0` 只開一次 (舊版每顆重開一次)。
-3. 依序對每顆做 `SimpleMFRC522.scanOnce()`：
+3. 依序對每顆做 `SimpleMFRC522.scanOnce()`，每顆用自己生效的時序 (`RfidTimingConfig.forReader`)：
    - RST 拉高，等 `rstSettleMs` 讓振盪器啟動。
    - 讀 VersionReg 做連線檢查。讀不到 0x91 / 0x92 之類的合理值，
      最多再等 `linkCheckTimeoutMs`，仍讀不到就回報 **線路異常**，不再送 REQA。
@@ -58,24 +59,34 @@ UI 分不出是沒放餐盤還是線有問題。
 
 預設值以 MFRC522 datasheet 與 Arduino MFRC522 library 的保守值為準：
 
-| 欄位 | 預設 | 依據 |
+| 欄位 | 預設 | 可對單顆覆寫 | 依據 |
+|---|---|---|---|
+| `spiSpeedHz` | 1000000 | 否 (整條 bus 共用) | 舊版相同 |
+| `rstSettleMs` | 50 | 是 | datasheet 8.8.2 只要求晶振啟動時間 + 37.74 µs，Arduino library 取 50 ms |
+| `linkCheckTimeoutMs` | 50 | 是 | 保險用，線路正常時不會用到 |
+| `antennaSettleMs` | 5 | 是 | ISO 14443-3 要求卡片在場開啟後 5 ms 內就緒 |
+| `reqaTimeoutMs` | 25 | 是 | Arduino library 的 timer 設定 |
+| `reqaAttempts` | 2 | 是 | 卡片剛上電偶爾會漏掉第一次 REQA |
+| `commDeadlineMs` | 36 | 是 | Arduino library 的牆鐘上限 |
+| `interReaderGapMs` | 1 | 否 | 兩顆之間的間隔 |
+| `postScanSettleMs` | 0 | 否 | 舊版為 500 |
+| `scanTimeoutSec` | 10 | 否 | 整輪逾時，會自動至少是最壞情況的兩倍 |
+
+每顆的時間：
+
+| 情境 | 每顆約 |
+|---|---|
+| 有卡片 | `rstSettleMs + antennaSettleMs + 約 6 ms` (REQA 幾乎立刻有回應) |
+| 沒有卡片 | `rstSettleMs + antennaSettleMs + reqaTimeoutMs × reqaAttempts + 約 5 ms` |
+
+| 設定 | 七顆都有卡 | 七顆都沒卡 |
 |---|---|---|
-| `spiSpeedHz` | 1000000 | 舊版相同 |
-| `rstSettleMs` | 50 | datasheet 8.8.2 只要求晶振啟動時間 + 37.74 µs，Arduino library 取 50 ms |
-| `linkCheckTimeoutMs` | 50 | 保險用，線路正常時不會用到 |
-| `antennaSettleMs` | 5 | ISO 14443-3 要求卡片在場開啟後 5 ms 內就緒 |
-| `reqaTimeoutMs` | 25 | Arduino library 的 timer 設定 |
-| `reqaAttempts` | 2 | 卡片剛上電偶爾會漏掉第一次 REQA |
-| `commDeadlineMs` | 36 | Arduino library 的牆鐘上限 |
-| `interReaderGapMs` | 1 | 兩顆之間的間隔 |
-| `postScanSettleMs` | 0 | 舊版為 500 |
-| `scanTimeoutSec` | 10 | 整輪逾時，舊版為 30 |
+| 保守預設值 50 / 5 / 25 ms × 2 | 約 0.4 s | 約 0.8 s |
+| 最佳化後例如 15 / 2 / 10 ms × 1 | 約 0.15 s | 約 0.2 s |
 
-無卡時每顆約 `rstSettleMs + antennaSettleMs + reqaTimeoutMs × reqaAttempts + 幾 ms`，
-預設值下 7 顆一輪約 0.8 秒；有卡的讀卡機更快，因為 REQA 不用等到逾時。
-校正後 `rstSettleMs` 通常可以降到 10 到 20 ms，一輪約 0.5 秒。
+設定頁的卡片會顯示目前設定的估計值與上次實測值。
 
-## 3. 設定檔與環境變數
+## 3. 設定檔、每顆覆寫與環境變數
 
 設定檔是 JSON，路徑依序為：
 
@@ -88,55 +99,102 @@ UI 分不出是沒放餐盤還是線有問題。
 {
   "spiSpeedHz": 500000,
   "rstSettleMs": 20,
-  "linkCheckTimeoutMs": 50,
   "antennaSettleMs": 5,
   "reqaTimeoutMs": 25,
   "reqaAttempts": 2,
-  "commDeadlineMs": 36,
-  "interReaderGapMs": 1,
-  "postScanSettleMs": 0,
-  "scanTimeoutSec": 10
+  "readers": {
+    "01": { "rstSettleMs": 15, "antennaSettleMs": 2, "reqaTimeoutMs": 10, "reqaAttempts": 1 },
+    "07": { "rstSettleMs": 30, "antennaSettleMs": 10, "reqaTimeoutMs": 15, "reqaAttempts": 2 }
+  }
 }
 ```
 
-只寫想改的欄位也可以，其餘沿用預設值。每個欄位也能用環境變數覆寫，
-名稱是 `RFID_` 加上大寫蛇形，例如：
+- 頂層是全域值，只寫想改的欄位也可以，其餘沿用預設值。
+- `readers` 區段對單顆讀卡機覆寫，key 是 deviceId (`"01"` 到 `"07"`)，
+  只有上表標「可對單顆覆寫」的欄位有效，其他會被忽略。沒寫的欄位用全域值。
+- 每個全域欄位也能用環境變數覆寫，名稱是 `RFID_` 加上大寫蛇形，例如：
 
 ```bash
 RFID_SPI_SPEED_HZ=250000 RFID_RST_SETTLE_MS=30 flutter run
 ```
 
-超出範圍的值會被夾回邊界 (範圍見 `RfidTimingConfig.ranges`)。
+- 超出範圍的值 (含覆寫) 會被夾回邊界，範圍見 `RfidTimingConfig.ranges`。
 
-app 在第一次掃描時載入設定；改了檔案之後，到設定頁展開「輪巡時序設定」按
-「重新載入設定檔」，或重新啟動 app。設定頁同時會顯示設定來源、每個值、
-估計一輪時間、上次掃描耗時與每顆讀卡機的摘要 (版本、就緒時間、耗時)。
+app 在第一次掃描時載入設定。改了檔案之後，到設定頁按「重新載入設定檔」或重新啟動 app。
 
-## 4. 在 Pi 上校正
+## 4. 設定頁
 
-校正工具是 `scripts/rfid_calibrate.dart`，跟 app 共用同一套驅動與設定檔。
+設定頁左欄的「輪巡時序設定」卡片顯示目前的 SPI 時脈、主要等待值、有幾顆有個別覆寫、
+估計一輪時間 (全部沒卡 / 七顆都有卡)、上次實測耗時與設定來源，並有四個按鈕：
+
+| 按鈕 | 做什麼 |
+|---|---|
+| 編輯設定 | 表單修改所有全域值 (有範圍檢查)，列出每顆的覆寫值並可清除，按「儲存」寫入設定檔並立即生效 |
+| 連線檢測 | 不用放卡片。量每顆在 1 MHz / 500 kHz / 250 kHz 下的就緒時間與讀寫錯誤率，並建議 SPI 時脈與 RST 等待，可一鍵套用 |
+| 自動最佳化 | 七顆都放卡片後執行第 5 節的演算法，顯示進度，結束後列出每顆的建議值與驗證結果，按「套用並儲存」寫入 |
+| 重新載入設定檔 | 手動改過 JSON 之後重新讀取 |
+
+掃描與校正互斥：校正進行中不能掃描，掃描中也不能開始校正。
+所有硬體操作都在背景 isolate 執行，UI 不會卡住。
+
+## 5. 自動最佳化演算法
+
+目標：一輪掃描時間最短，且七顆讀卡機在驗證輪數內全部 100% 讀到卡片。
+測試時七顆都要放上卡片，過程中不要移動卡片。
+
+1. **連線階段 (不用卡)**：對每個候選 SPI 時脈 (預設 1 MHz、500 kHz、250 kHz)，
+   量每顆的 VersionReg 就緒時間與 200 次寫入讀回的錯誤數。
+   取「所有讀卡機都零錯誤」的最高時脈；都有錯誤就取錯誤最少的並提醒檢查走線。
+   每顆的就緒時間決定它 `rstSettleMs` 候選值的下限 (就緒時間 × 2 + 5 ms，最低 10 ms)。
+2. **確認階段**：用最保守的候選值跑 N 輪。讀不到卡的讀卡機標為「不穩定」，
+   不參與後面的搜尋並維持原設定，通常是卡片沒放好或線路問題。
+3. **掃描階段**：依序對 `rstSettleMs` (50 → 30 → 20 → 15 → 10)、
+   `antennaSettleMs` (20 → 10 → 5 → 2 → 0)、`reqaTimeoutMs` (25 → 15 → 10 → 5)、
+   `reqaAttempts` (2 → 1) 由大往小試。每顆讀卡機各自有自己的候選值與進度，
+   但一輪掃描本來就會輪過七顆，所以七顆在同一輪裡各測各的候選值，
+   每顆各自搜尋不需要七倍時間。每個候選值跑 N 輪，全中才往下一個更小的值走；
+   取最小可過的值之後，時間類參數再往上加「安全餘裕」階數 (預設 1 階)。
+4. **驗證階段**：用最終值跑 M 輪。任何一顆漏讀就把它的時間類參數各放寬一階、
+   REQA 次數回到最多，然後重驗 (最多 2 次)；仍失敗的讀卡機退回原設定並標記。
+5. **輸出**：SPI 時脈、每顆的覆寫值、每顆的驗證命中率、估計一輪時間 (前後對照) 與說明。
+   「套用並儲存」會把 SPI 時脈與 `readers` 覆寫寫入設定檔，全域值不動。
+
+預設 N = 5、M = 20，整個流程約 30 到 60 秒。輪數與餘裕都可以在對話框裡調。
+「穩定」的判定是統計上的：N 輪全中只能排除很明顯的失敗，
+所以要靠餘裕階數與較多的驗證輪數把邊緣值排除；卡片位置、溫度改變後可以重跑一次。
+
+## 6. CLI
+
+校正工具是 `scripts/rfid_calibrate.dart`，跟 app 共用同一套驅動、演算法與設定檔。
 執行前先關閉 Smart Bite app，否則 GPIO 會顯示 busy。
 
 ```bash
 cd ~/Desktop/smart_bite
 
-# 0. 看目前生效的設定與來源
+# 看目前生效的設定與來源 (含每顆覆寫)
 dart run scripts/rfid_calibrate.dart show
 
-# 1. 量每顆在 1 MHz / 500 kHz / 250 kHz 下的連線品質 (不需要放卡片)
+# 連線品質 (不需要放卡片)
 dart run scripts/rfid_calibrate.dart link
 
-# 2. 依量測結果推薦 spiSpeedHz 與 rstSettleMs，加 --write 直接寫入設定檔
+# 只依連線品質推薦 spiSpeedHz 與 rstSettleMs，--write 寫入設定檔
 dart run scripts/rfid_calibrate.dart recommend --write
 
-# 3. 放好卡片，掃描不同的 RST / 天線等待值，看哪一組每顆都穩定讀到
+# 自動最佳化 (七顆都放卡片)，--write 寫入 SPI 時脈與每顆覆寫
+dart run scripts/rfid_calibrate.dart optimize --write
+dart run scripts/rfid_calibrate.dart optimize --sweep-rounds 10 --verify-rounds 50 --margin 2
+
+# 以目前設定跑 10 輪，看每輪耗時與每顆的成功率
+dart run scripts/rfid_calibrate.dart bench --rounds 10 --verbose
+
+# 手動掃描 RST / 天線等待值組合 (放卡片)
 dart run scripts/rfid_calibrate.dart sweep --rst 5,10,20,50 --antenna 0,2,5,10 --rounds 5
 
-# 4. 把選好的值寫入
+# 直接改設定檔：全域值、單顆覆寫、清除覆寫
 dart run scripts/rfid_calibrate.dart set rstSettleMs=20 antennaSettleMs=5
-
-# 5. 用目前設定跑 10 輪，看每輪耗時與每顆的成功率
-dart run scripts/rfid_calibrate.dart bench --rounds 10 --verbose
+dart run scripts/rfid_calibrate.dart set 07.rstSettleMs=30 07.antennaSettleMs=10
+dart run scripts/rfid_calibrate.dart set 07.clear
+dart run scripts/rfid_calibrate.dart set clear
 ```
 
 `link` 的輸出範例：
@@ -149,13 +207,11 @@ dart run scripts/rfid_calibrate.dart bench --rounds 10 --verbose
 ```
 
 - 「就緒 ms」是 RST 拉高後 VersionReg 變成可讀的時間，`rstSettleMs` 只要比它大一些就夠。
-  `recommend` 用「最大就緒時間 × 2 + 5 ms、最低 10 ms、不高於目前值」推薦。
-- 「錯誤/樣本」是寫入再讀回不一致的次數。不是 0 就代表這個時脈下 SPI 不可靠，
-  `recommend` 會選所有讀卡機都零錯誤的最高時脈。線最長的那顆通常最先出錯。
+- 「錯誤/樣本」是寫入再讀回不一致的次數。不是 0 就代表這個時脈下 SPI 不可靠，線最長的那顆通常最先出錯。
 
 指令都可以加 `--readers 1,2,7` 只測某幾顆、`--file <path>` 指定設定檔、`--verbose` 看細節。
 
-## 5. 長線的硬體建議
+## 7. 長線的硬體建議
 
 七顆模組共用 MISO、MOSI、SCK 與 CE0，被 RST 拉低的晶片輸出腳是「凍結」而不是高阻抗，
 線越長、負載越重，1 MHz 的訊號邊緣越差。校正之外可以做的：
@@ -170,26 +226,30 @@ dart run scripts/rfid_calibrate.dart bench --rounds 10 --verbose
   而且 CS 拉高時 MISO 會真正進高阻抗。這需要多接 7 條線與軟體改動，目前的架構已預留
   `Mfrc522Transport` 與 `ResetLine` 抽象，可以在不動業務邏輯的情況下替換。
 
-## 6. 疑難排解
+## 8. 疑難排解
 
 | 現象 | 可能原因 | 處理 |
 |---|---|---|
 | 某顆一直「線路異常」，VersionReg=0x00 | MISO 沒接到、RST 沒拉高、模組沒電 | 量 RST 腳與 3.3V，換線 |
 | VersionReg=0xFF | MISO 浮接或短路到高電位 | 檢查 MISO |
-| 「晶片無回應」但 VersionReg 正常 | SCK / MOSI 訊號品質差，指令寫不進去 | 先 `set spiSpeedHz=500000`，再跑 `link` |
-| 有卡但偶爾讀不到 | 天線等待不夠或卡片離天線太遠 | `sweep --antenna 5,10,20`，或 `set reqaAttempts=3` |
+| 「晶片無回應」但 VersionReg 正常 | SCK / MOSI 訊號品質差，指令寫不進去 | 先降 SPI 時脈，再跑連線檢測 |
+| 最佳化說某顆「最保守的設定下仍讀不到卡片」 | 卡片沒放好、卡片壞了或天線區被金屬蓋住 | 調整卡片位置後重跑 |
+| 最佳化後偶爾漏讀 | 餘裕不夠或卡片位置跟校正時不同 | 用「安全餘裕 2 階」重跑，或手動把該顆的值調大 |
 | 一輪時間忽長忽短 | 某顆在 timeout 邊緣 | `bench --verbose` 找出那顆，檢查接線 |
 | `GPIOerrorCode.gpioErrorOpen` / busy | app 還在跑或上次沒正常結束 | 關 app，跑 `sudo ./scripts/gpio_cleanup.sh` |
 
-## 7. 相關檔案
+## 9. 相關檔案
 
 | 檔案 | 內容 |
 |---|---|
-| `lib/services/rfid_timing_config.dart` | 時序設定、載入順序、範圍檢查 |
+| `lib/services/rfid_timing_config.dart` | 時序設定、每顆覆寫、載入順序、範圍檢查、時間估算 |
 | `lib/services/mfrc522.dart` | 暫存器層驅動，牆鐘上限的 `communicate()` |
 | `lib/services/simple_mfrc522.dart` | 單顆讀取流程、連線檢查、校正用的 `probeLink()` |
-| `lib/services/rfid_polling_service.dart` | 一輪掃描 |
-| `lib/services/rfid_calibration.dart` | 校正推薦邏輯與報表 |
-| `lib/adapters/gpio_spi_rfid_adapter.dart` | Flutter 端：載入設定、在 isolate 執行掃描、轉成 UI 狀態 |
-| `scripts/rfid_calibrate.dart` | Pi 上的校正 CLI |
+| `lib/services/rfid_polling_service.dart` | 掃描 session 與一輪掃描 |
+| `lib/services/rfid_calibration.dart` | 連線品質推薦邏輯與報表 |
+| `lib/services/rfid_optimizer.dart` | 自動最佳化演算法、選項、進度與結果 |
+| `lib/adapters/gpio_spi_rfid_adapter.dart` | Flutter 端：載入與儲存設定、在 isolate 執行掃描 / 連線檢測 / 最佳化 |
+| `lib/widgets/rfid_timing_settings.dart` | 設定頁的卡片、編輯對話框、連線檢測、自動最佳化 UI |
+| `scripts/rfid_calibrate.dart` | Pi 上的 CLI |
+| `test/unit/rfid_optimizer_test.dart` | 用模擬讀卡機驗證演算法 |
 | `test/unit/mfrc522_driver_test.dart` | 用假 transport 驗證驅動與讀取流程 |

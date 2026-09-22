@@ -6,8 +6,13 @@
 /// 3. 依序把每顆叫醒、讀卡、再關掉 (見 [SimpleMFRC522.scanOnce])
 /// 4. 釋放 GPIO 與 SPI
 ///
+/// [RfidScanSession] 把 GPIO 與 SPI 保持開啟，可以連續跑很多輪
+/// (校正與最佳化用)；[RFIDPollingService.performOneLoopCycles] 則是
+/// 開一次、掃一輪、關掉，給 app 的按鈕觸發掃描用。
+///
 /// 舊版每顆固定睡 500 ms 三次 (init 後、reset 後、dispose 時)，
-/// 七顆一輪約 12 秒；新版的等待值全部來自 [RfidTimingConfig]。
+/// 七顆一輪約 12 秒；新版的等待值全部來自 [RfidTimingConfig]，
+/// 而且每顆可以有自己的覆寫值 ([RfidTimingConfig.forReader])。
 library;
 
 import 'dart:async';
@@ -63,24 +68,36 @@ class ScanCycleResult {
       'ScanCycleResult(${totalMs}ms, $cardCount cards, errors: $errorReaderIds)';
 }
 
-/// 依序輪巡多顆 RC522
-class RFIDPollingService {
+/// 把 GPIO 與 SPI 保持開啟的掃描 session，可連續跑多輪。
+///
+/// SPI 時脈在 [open] 時決定 (用 [timing] 的 `spiSpeedHz`)，
+/// 之後 [scanCycle] 傳入的時序只影響等待值與 REQA 設定。
+class RfidScanSession {
+  final List<ReaderConfig> configs;
   final RfidTimingConfig timing;
   final RfidLog? log;
 
-  RFIDPollingService({RfidTimingConfig? timing, this.log})
-      : timing = (timing ?? RfidTimingConfig.defaults).validated();
+  final Map<int, SPI> _buses = {};
+  final List<GpioResetLine> _lines = [];
+  final List<SimpleMFRC522> _readers = [];
 
-  /// 對 [configs] 的每一顆各讀一次
-  Future<ScanCycleResult> performOneLoopCycles(
-    List<ReaderConfig> configs,
-  ) async {
-    final stopwatch = Stopwatch()..start();
-    final results = <String, ReaderScanResult>{};
-    final buses = <int, SPI>{};
-    final lines = <GpioResetLine>[];
-    final readers = <SimpleMFRC522>[];
+  /// 開啟時就失敗的讀卡機 (例如 GPIO busy)，每輪都會直接回報這個錯誤
+  final Map<String, ReaderScanResult> _openErrors = {};
+  bool _isOpen = false;
 
+  RfidScanSession(
+    this.configs, {
+    RfidTimingConfig? timing,
+    this.log,
+  }) : timing = (timing ?? RfidTimingConfig.defaults).validated();
+
+  bool get isOpen => _isOpen;
+
+  List<String> get deviceIds => configs.map((c) => c.deviceId).toList();
+
+  /// 開啟所有 RST (全部拉低) 與 SPI bus。已開啟時不做事。
+  void open() {
+    if (_isOpen) return;
     try {
       // 先把所有 RST 拉低，確保 bus 上一次只有一顆醒著
       for (final config in configs) {
@@ -89,66 +106,134 @@ class RFIDPollingService {
           line.open();
         } catch (e) {
           _log('${config.deviceId}: 無法開啟 RST GPIO${config.rstPin}: $e');
-          results[config.deviceId] = ReaderScanResult(
+          _openErrors[config.deviceId] = ReaderScanResult(
             deviceId: config.deviceId,
             status: ReaderScanStatus.error,
             error: 'GPIO${config.rstPin}: $e',
           );
           continue;
         }
-        lines.add(line);
+        _lines.add(line);
 
-        final spi = buses.putIfAbsent(
+        final spi = _buses.putIfAbsent(
           config.spiNum,
           () => SPI(config.spiNum, 0, SPImode.mode0, timing.spiSpeedHz),
         );
-        readers.add(SimpleMFRC522(
+        _readers.add(SimpleMFRC522(
           deviceNum: config.deviceNum,
           resetLine: line,
           transport: SpiMfrc522Transport(spi),
-          timing: timing,
+          timing: timing.forReader(config.deviceId),
         ));
       }
+      _isOpen = true;
+    } catch (e) {
+      close();
+      rethrow;
+    }
+  }
 
-      for (final reader in readers) {
-        final result = await reader.scanOnce();
-        results[reader.deviceId] = result;
-        _log('${reader.deviceId}: ${result.summary}');
-        if (timing.interReaderGapMs > 0) {
-          await Future<void>.delayed(
-            Duration(milliseconds: timing.interReaderGapMs),
-          );
-        }
-      }
-    } finally {
-      for (final line in lines) {
-        try {
-          line.low();
-          line.dispose();
-        } catch (e) {
-          _log('釋放 RST GPIO${line.pin} 失敗: $e');
-        }
-      }
-      for (final spi in buses.values) {
-        try {
-          spi.dispose();
-        } catch (e) {
-          _log('關閉 SPI 失敗: $e');
-        }
-      }
-      if (timing.postScanSettleMs > 0) {
+  /// 對每一顆各讀一次。[timing] 不給就用 session 的設定。
+  Future<ScanCycleResult> scanCycle({RfidTimingConfig? timing}) async {
+    if (!_isOpen) open();
+    final effective = (timing ?? this.timing).validated();
+    final stopwatch = Stopwatch()..start();
+    final results = <String, ReaderScanResult>{..._openErrors};
+
+    for (final reader in _readers) {
+      final result = await reader.scanOnce(
+        timing: effective.forReader(reader.deviceId),
+      );
+      results[reader.deviceId] = result;
+      _log('${reader.deviceId}: ${result.summary}');
+      if (effective.interReaderGapMs > 0) {
         await Future<void>.delayed(
-          Duration(milliseconds: timing.postScanSettleMs),
+          Duration(milliseconds: effective.interReaderGapMs),
         );
       }
     }
 
-    final cycle = ScanCycleResult(
+    if (effective.postScanSettleMs > 0) {
+      await Future<void>.delayed(
+        Duration(milliseconds: effective.postScanSettleMs),
+      );
+    }
+
+    return ScanCycleResult(
       readers: results,
       totalMs: stopwatch.elapsedMilliseconds,
     );
-    _log('一輪掃描完成: $cycle');
-    return cycle;
+  }
+
+  /// 量測每顆的連線品質 (見 [SimpleMFRC522.probeLink])
+  Future<List<LinkProbeResult>> probeLinks({
+    int samples = 200,
+    int maxReadyMs = 300,
+    Iterable<String>? deviceIds,
+  }) async {
+    if (!_isOpen) open();
+    final wanted = deviceIds?.toSet();
+    final results = <LinkProbeResult>[];
+    for (final reader in _readers) {
+      if (wanted != null && !wanted.contains(reader.deviceId)) continue;
+      final probe = await reader.probeLink(
+        samples: samples,
+        maxReadyMs: maxReadyMs,
+      );
+      results.add(probe);
+      _log('${reader.deviceId}: $probe');
+    }
+    return results;
+  }
+
+  /// RST 全部拉低並釋放 GPIO 與 SPI。可重複呼叫。
+  void close() {
+    for (final line in _lines) {
+      try {
+        line.low();
+        line.dispose();
+      } catch (e) {
+        _log('釋放 RST GPIO${line.pin} 失敗: $e');
+      }
+    }
+    _lines.clear();
+    _readers.clear();
+    for (final spi in _buses.values) {
+      try {
+        spi.dispose();
+      } catch (e) {
+        _log('關閉 SPI 失敗: $e');
+      }
+    }
+    _buses.clear();
+    _openErrors.clear();
+    _isOpen = false;
+  }
+
+  void _log(String message) => log?.call(message);
+}
+
+/// 依序輪巡多顆 RC522
+class RFIDPollingService {
+  final RfidTimingConfig timing;
+  final RfidLog? log;
+
+  RFIDPollingService({RfidTimingConfig? timing, this.log})
+      : timing = (timing ?? RfidTimingConfig.defaults).validated();
+
+  /// 對 [configs] 的每一顆各讀一次：開啟 session、掃一輪、關閉
+  Future<ScanCycleResult> performOneLoopCycles(
+    List<ReaderConfig> configs,
+  ) async {
+    final session = RfidScanSession(configs, timing: timing, log: log);
+    try {
+      session.open();
+      final cycle = await session.scanCycle();
+      _log('一輪掃描完成: $cycle');
+      return cycle;
+    } finally {
+      session.close();
+    }
   }
 
   void _log(String message) => log?.call(message);

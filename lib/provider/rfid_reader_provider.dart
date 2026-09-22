@@ -11,6 +11,9 @@ library;
 import 'package:flutter/material.dart';
 import '../interfaces/rfid_reader.dart';
 import '../services/meal_identification_service.dart';
+import '../services/rfid_calibration.dart';
+import '../services/rfid_optimizer.dart';
+import '../services/rfid_timing_config.dart';
 
 /// Provider for managing RFID readers and meal identification
 class RFIDReaderProvider extends ChangeNotifier {
@@ -62,6 +65,64 @@ class RFIDReaderProvider extends ChangeNotifier {
       .map((reader) => reader.deviceId)
       .toList();
 
+  /// 是否支援時序設定、連線檢測與自動最佳化
+  bool get supportsCalibration => _readerManager.supportsCalibration;
+
+  /// 連線檢測或自動最佳化進行中
+  bool get isCalibrating => _readerManager.isCalibrating;
+
+  /// 目前載入的時序設定 (含來源)
+  RfidTimingLoadResult? get timingLoad => _readerManager.timingLoad;
+
+  /// 讀取 (必要時載入) 時序設定
+  Future<RfidTimingLoadResult?> loadTiming() async {
+    final load = await _readerManager.loadTiming();
+    notifyListeners();
+    return load;
+  }
+
+  /// 儲存時序設定並重新載入
+  Future<void> saveTiming(RfidTimingConfig config) async {
+    await _readerManager.saveTiming(config);
+    notifyListeners();
+  }
+
+  /// 連線檢測
+  Future<List<LinkMeasurement>> probeLinks({
+    List<int>? speeds,
+    int samples = 200,
+    void Function(String message)? onProgress,
+  }) async {
+    notifyListeners();
+    try {
+      return await _readerManager.probeLinks(
+        speeds: speeds,
+        samples: samples,
+        onProgress: onProgress,
+      );
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  /// 自動最佳化 (七顆都要放卡片)
+  Future<OptimizationResult> optimize(
+    RfidOptimizerOptions options, {
+    void Function(OptimizerProgress progress)? onProgress,
+    RfidCancelToken? cancel,
+  }) async {
+    notifyListeners();
+    try {
+      return await _readerManager.optimize(
+        options,
+        onProgress: onProgress,
+        cancel: cancel,
+      );
+    } finally {
+      notifyListeners();
+    }
+  }
+
   // ========== Methods ==========
 
   /// Discover and initialize all available readers
@@ -85,6 +146,10 @@ class RFIDReaderProvider extends ChangeNotifier {
   Future<void> updateReaders() async {
     if (_isScanning) {
       debugPrint('Scan already in progress, skipping');
+      return;
+    }
+    if (isCalibrating) {
+      debugPrint('Calibration in progress, skipping scan');
       return;
     }
 

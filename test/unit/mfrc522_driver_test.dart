@@ -585,13 +585,13 @@ void main() {
           FakeExchange.ok([0x04, 0x00]),
           FakeExchange.ok([...cardUid, cardBcc]),
         ],
-      )..dropNextWrites = 3;
-      // 讓「寫 0 被遺失」也看得出來：先把前兩個會寫 0 的暫存器填成 0xFF
+      )..dropNextWrites = 2;
+      // 讓「寫 0 被遺失」也看得出來：先把第一個會寫 0 的暫存器填成 0xFF。
+      // 連續遺失 2 次仍在 writeVerifyRetries (2) 的範圍內，第三次寫入成功。
       bus.registers[MFRC522Registers.txModeReg] = 0xFF;
-      bus.registers[MFRC522Registers.rxModeReg] = 0xFF;
       final result = await reader(bus).scanOnce();
       expect(result.status, ReaderScanStatus.card);
-      expect(result.spiRetries, 3);
+      expect(result.spiRetries, 2);
       expect(result.rereads, 0);
     });
 
